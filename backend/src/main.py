@@ -23,6 +23,7 @@ from src.routes import (
     insights,
     managed,
     memos,
+    reports,
 )
 
 logging.basicConfig(level=settings.log_level)
@@ -72,6 +73,9 @@ app.include_router(auto_dispatch.router)
 
 # 메모 집계 인사이트 — 필터 5종 + LLM. 라우트 내부 trigger_auth.
 app.include_router(aggregated_insights.router)
+
+# 배포 전/후 비교 일일 리포트 — 자체 인증(X-Trigger-Secret 또는 세션)
+app.include_router(reports.router)
 
 
 @app.get("/")

@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     auto_dispatch_slack_webhook: str = ""       # 슬랙 알림 URL (옵션)
     auto_dispatch_trigger_secret: str = ""      # X-Trigger-Secret 헤더 우회 (CLI·Cloud Scheduler용)
 
+    # 배포 전/후 비교 일일 리포트 (Cloud Scheduler → Slack n8n 릴레이)
+    ab_report_webhook: str = ""                 # n8n 릴레이 URL. 빈 값이면 발송 안 함(계산만)
+    ab_report_slack_target: str = ""            # Slack 채널 ID 또는 사용자 ID(=DM)
+    ab_report_anchor_kst: str = "2026-09-02 11:57"   # 배포 앵커 (KST, "YYYY-MM-DD HH:MM")
+    ab_report_days: int = 30                    # 이 일수까지만 발송. 마지막 회차는 최종 요약
+
     @property
     def origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]

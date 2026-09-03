@@ -1,7 +1,9 @@
 """자동 디스패치 — 지원 0개 신청서에 LLM 추천 선생님 추가 + 방문 제안 발송.
 
 흐름:
-  1) 신청서 1차 필터 (replica: status=10, age≥1h, 지목 0명, 좌표 있음)
+  1) 신청서 1차 필터 (replica: status=10, age≥min_age(운영 1h), 지목 0명,
+     수업 가능한 선생님 1명 이하, 좌표 있음,
+     부모 observation_level 관리필요/추천제한/이용제한 제외)
   2) PG 제외 (auto_run.live / memo / handler 어느 하나라도 있으면 skip)
   3) 일일 cap (live만): KST 오늘 처리한 신청서 수가 daily_max_apps 이상이면 중단
   4) 신청서별 처리:
@@ -71,15 +73,8 @@ _LLM_MAX_TOKENS = 4096
 
 _VARIANT_NGU = {0: 3, 1: 3, 2: 1}  # 미사용 (variant 항상 0). 참고용 유지.
 
-# A1 시급 매칭 ±20% 범위 (모든 arm 공통)
-_WAGE_RANGES = {
-    "STUDY_FRIENDLY":             (0, 22800),
-    "STUDY_HIGHLY_EXPERIENCED":   (15200, 34800),
-    "STUDY_VETERAN":              (23200, 10_000_000),
-    "CARE_FRIENDLY":              (0, 19200),
-    "CARE_VETERAN":               (12800, 10_000_000),
-}
-# 위에 없는 코드(STUDY_MODERATE, CARE_LEVEL_*, NONE, ALL_WAGE 등)는 deprecated — 무관 통과.
+# A1 시급 하드필터는 2026-09-02 제거됨. 시급대 정본(_WAGE_RANGES)은
+# routes/candidates.py 로 옮겨 LLM 입력 신호로만 쓴다.
 
 _DAY_KEY = {
     "MONDAY": "mon", "TUESDAY": "tue", "WEDNESDAY": "wed",
@@ -110,23 +105,24 @@ def _vet_pass(c: dict[str, Any]) -> bool:
     return True
 
 
-def _a1_wage_match(c: dict[str, Any], wage_types: list[str]) -> bool:
-    """A1: 신청서 wage_range_type 중 하나라도 선생님 시급(±20%) 매칭이면 OK.
-    deprecated 코드만 있으면 무관 통과. wage_types 비어있어도 통과."""
-    if not wage_types:
-        return True
-    t_wage = int(c.get("subject_wage") or 0)
-    for wt in wage_types:
-        if wt not in _WAGE_RANGES:
-            return True  # deprecated → 무관 통과
-        lo, hi = _WAGE_RANGES[wt]
-        if lo <= t_wage <= hi:
-            return True
-    return False
-
-
 def _a2_day_match(c: dict[str, Any], schedule_json: Any) -> bool:
-    """A2: 신청서 possible_day_of_weeks ∩ 선생님 가용요일 ≥ 1."""
+    """A2: 신청서 possible_day_of_weeks ∩ 선생님 가용요일 ≥ 1.
+
+    '요일 정보 없음'은 양쪽 모두 판단 불가로 보고 통과시킨다.
+      - 신청서에 요일이 없으면 통과 (기존)
+      - 선생님 요일 데이터가 없어도 통과 (2026-08-31 추가)
+        schedule row 자체가 없으면 mon~sun 이 전부 None,
+        row 는 있으나 미입력이면 전부 0 — 둘 다 '미설정'으로 취급.
+
+    근거: 최근 5일 11,379 (신청서×선생님) 쌍 실측
+      요일 일치      9,045쌍 수락률 3.17%
+      요일 불일치    1,241쌍 수락률 1.77%
+      요일 미설정    1,093쌍 수락률 4.12%  ← 세 그룹 중 최고
+    미설정은 '시간이 없다'가 아니라 '폼을 안 채웠다'는 뜻이라 배제 근거가 없다.
+    R1+R2 통과 256명 중 33명(12.9%)이 여기 해당하며, 이들의 90일 평균 지원은
+    4.52건으로 요일 설정자(3.20건)보다 오히려 활발하다.
+    요일이 실제로 안 맞는 후보는 LLM 이 day_match 를 최우선 신호로 보고 거른다.
+    """
     try:
         sched = json.loads(schedule_json) if isinstance(schedule_json, str) else schedule_json
     except (ValueError, TypeError):
@@ -135,7 +131,9 @@ def _a2_day_match(c: dict[str, Any], schedule_json: Any) -> bool:
         return True
     days = sched.get("possible_day_of_weeks") or []
     if not days:
-        return True  # 요일 정보 없으면 통과
+        return True  # 신청서에 요일 정보 없으면 통과
+    if not any(bool(c.get(k)) for k in _DAY_KEY.values()):
+        return True  # 선생님 요일 미설정(None 또는 전부 0) → 판단 불가 → 통과
     for d in days:
         key = _DAY_KEY.get(d)
         if key and bool(c.get(key)):
@@ -161,22 +159,25 @@ def _a6_gender_match(c: dict[str, Any], preferred_gender: int | None) -> bool:
 def _apply_variant_filter(
     c: dict[str, Any],
     variant: int,
-    wage_types: list[str],
     schedule_json: Any,
     preferred_gender: int | None,
 ) -> bool:
-    """V0 로직 hard filter (2026-07-02 승격).
+    """V0 로직 hard filter.
 
-    R1+R2 + A1(시급±20%) + A2(요일) + A6(성별) — 전 신청서 공통.
+    R1+R2 + A2(요일) + A6(성별) — 전 신청서 공통.
     variant 파라미터는 하위호환 위해 유지 (_assign_variant가 항상 0).
+
+    A1(시급) 은 2026-09-02 제거. 참조하던 _WAGE_RANGES 가 2026-04~05 코드 이관을
+    반영하지 못해 신청서의 82.4% 에서 무력화돼 있었고, 작동하는 나머지에서는
+    희망 상한 초과 선생님의 수락률이 2.4~3.4배 높아 역방향으로 동작했다.
+    정본 범위로 정렬하면 오히려 실제 성사 매칭의 31% 를 차단한다.
+    시급대는 이제 LLM 입력(parent_wage_preference)의 소프트 신호로만 쓴다.
     """
     if not _vet_pass(c):
         return False
     if not _a6_gender_match(c, preferred_gender):
         return False
     if not _a2_day_match(c, schedule_json):
-        return False
-    if not _a1_wage_match(c, wage_types):
         return False
     return True
 
@@ -369,7 +370,7 @@ async def _process_one(
     preferred_gender = app.get("preferable_teacher_gender")
     filtered = [
         c for c in filtered
-        if _apply_variant_filter(c, variant, wage_types, schedule_json, preferred_gender)
+        if _apply_variant_filter(c, variant, schedule_json, preferred_gender)
     ]
     variant_removed = pre_variant_size - len(filtered)
     if not filtered:
@@ -406,7 +407,7 @@ async def _process_one(
         return {"sid": sid, "status": "skipped", "reason": "llm_daily_limit_exceeded",
                 "current": current, "variant": variant}
 
-    payload = _build_input(app, cand_views)
+    payload = _build_input(app, cand_views, wage_types)
     try:
         raw_text, parsed, in_tok, out_tok = await llm.generate_recommendation(
             payload,
@@ -610,7 +611,8 @@ async def _record_dashboard(
         f"[AI매칭 자동] LLM 추천 {len(top_items)}명 추가 + 방문제안 발송",
         "",
         "선정 기준:",
-        "• 신청서: 정기수업(regularity=2) · 지원·수락 0명 · 부모 지목 없음 · 생성 후 1시간 이상",
+        "• 신청서: 정기수업(regularity=2) · 수업 가능 선생님 1명 이하 · 부모 지목 없음 · 생성 후 1시간 이상",
+        "• 고객: 관리필요·추천제한·이용제한 등급 제외",
         f"• 후보 풀: 부모 좌표 인근 시군구 3개 · 과목={subject_name} · 활동중(2) 선생님만",
         f"• cooldown: 오늘 추천 알림 ≥{cap}건 받은 선생님 사전 제외",
         f"• 풀 규모: {pool_size}명 (cooldown {cooldown_removed}명 제외 후)",

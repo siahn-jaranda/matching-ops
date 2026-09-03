@@ -39,6 +39,38 @@ class AutoRunStore:
     async def aclose(self) -> None:
         await self._engine.dispose()
 
+    async def window_stats(self, start, end) -> tuple[dict, list[str]]:
+        """[start, end) 구간의 live run 집계 + 성공한 신청서 sid 목록.
+
+        배포 전/후 비교 리포트(routes/reports.py) 전용.
+        """
+        metrics = text(
+            """
+            SELECT COUNT(*) AS runs,
+                   COUNT(*) FILTER (WHERE succeed_count > 0) AS ok,
+                   COALESCE(SUM(succeed_count), 0) AS sent,
+                   COALESCE(SUM(denied_count), 0) AS denied_at_send,
+                   percentile_disc(0.5) WITHIN GROUP (ORDER BY pool_size)
+                     FILTER (WHERE succeed_count > 0) AS pool_p50,
+                   ROUND(AVG(pool_size) FILTER (WHERE succeed_count > 0), 1) AS pool_avg,
+                   ROUND(AVG(succeed_count) FILTER (WHERE succeed_count > 0), 1) AS avg_added,
+                   COUNT(*) FILTER (WHERE error_message LIKE 'empty_after_variant%') AS empty_filter,
+                   COUNT(*) FILTER (WHERE error_message LIKE 'no_candidates%') AS no_pool
+            FROM matching_ops_auto_run
+            WHERE dry_run = false AND run_at >= :s AND run_at < :e
+            """
+        )
+        sids_q = text(
+            """
+            SELECT recommendation_sid FROM matching_ops_auto_run
+            WHERE dry_run = false AND run_at >= :s AND run_at < :e AND succeed_count > 0
+            """
+        )
+        async with self._session_factory() as session:
+            m = (await session.execute(metrics, {"s": start, "e": end})).mappings().first()
+            sids = [r[0] for r in (await session.execute(sids_q, {"s": start, "e": end}))]
+        return dict(m or {}), sids
+
     async def get_excluded_sids(self, sids: list[str]) -> set[str]:
         """주어진 sid 중 자동 디스패치 제외할 sid 집합.
 

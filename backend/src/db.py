@@ -433,6 +433,55 @@ class JarandaReplica:
             result = await session.execute(query)
             return {int(row._mapping["id"]): row._mapping["name"] for row in result}
 
+    async def outcome_stats(self, sids: list[str], until=None) -> dict[str, int]:
+        """자동 디스패치가 처리한 신청서들의 성과 집계.
+
+        분모는 **suggested=1 (방문 제안을 실제로 받은 선생님)** 이다.
+        자발 지원(suggested=0, applied=1)은 봇 성과가 아니므로 분자·분모 모두에서 뺀다.
+
+        2026-09-03 정정: 이전 구현은 신청서에 달린 **모든** 행의 accepted 를 세고
+        분모로 PG succeed_count 를 썼다. 신청서 1건당 제안 외 행이 다수 섞여
+        수락률이 15.94% 처럼 비현실적으로 부풀었다(실제는 1% 대).
+
+        until 을 주면 그 시각 이전에 생성된 행만 센다. 전/후 구간의 관측 시간을
+        같게 맞추기 위한 것 — 없으면 시점 무관 전량.
+        """
+        if not sids:
+            return {"apps": 0, "offered": 0, "accepted": 0, "rejected": 0, "matched": 0}
+        cond = "" if until is None else " AND rt._created_at < :until"
+        params: dict[str, Any] = {"sids": sids}
+        if until is not None:
+            params["until"] = until
+        q_t = text(
+            f"""
+            SELECT
+              SUM(rt.suggested = 1) AS offered,
+              SUM(rt.suggested = 1 AND rt.accepted = 1) AS accepted,
+              SUM(rt.suggested = 1 AND rt.rejected = 1) AS rejected
+            FROM recommendation_teachers rt
+            WHERE rt.recommendation_sid IN :sids{cond}
+            """
+        ).bindparams(bindparam("sids", expanding=True))
+        q_r = text(
+            """
+            SELECT
+              COUNT(*) AS apps,
+              SUM(CASE WHEN r.status IN (40, 90) THEN 1 ELSE 0 END) AS matched
+            FROM recommendation r
+            WHERE r.sid IN :sids
+            """
+        ).bindparams(bindparam("sids", expanding=True))
+        async with self._session_factory() as session:
+            t = (await session.execute(q_t, params)).first()
+            r = (await session.execute(q_r, {"sids": sids})).first()
+        return {
+            "apps": int((r and r[0]) or 0),
+            "matched": int((r and r[1]) or 0),
+            "offered": int((t and t[0]) or 0),
+            "accepted": int((t and t[1]) or 0),
+            "rejected": int((t and t[2]) or 0),
+        }
+
     async def list_wage_ranges(self, sids: list[str]) -> dict[str, list[str]]:
         """신청서 sid → 부모님이 선택한 wage_range_type 코드 리스트 (DesiredCost enum).
 
@@ -914,8 +963,17 @@ class JarandaReplica:
             recommendation_teachers 에 requested=1 row 없음
             (부모가 신청서에서 특정 선생님을 콕 찍은 케이스는 자동화 대상에서 제외 —
             의향이 분명한 신청서를 시스템이 흔들지 않음)
-          - **지원·수락 0명**: recommendation_teachers 에 applied=1 OR accepted=1
-            row 없음 (운영자가 추천한 선생님이 있어도 응답이 없으면 자동화 대상)
+          - **수업 가능한 선생님 1명 이하**: recommendation_teachers 에서
+            applied=1 OR accepted=1 인 선생님 수 <= 1
+            (2026-09-02 변경: 이전에는 0명만 대상. 1명뿐이면 부모가 비교할 선택지가
+            사실상 없어 자동화로 후보를 늘려준다. 이미 응답한 선생님은
+            list_candidate_teachers 의 NOT EXISTS rt 로 중복 추가되지 않는다.)
+            NOTE: 기존 지목 체크와 동일하게 is_deleted 는 보지 않는다.
+          - **부모 주시 등급 제외**: account.observation_level IN (9, 90, 99)
+            = 관리필요(ELEPHANT 9) · 추천제한(DOLPHIN 90) · 이용제한(TURTLE 99).
+            관리필요는 매칭에 각별한 주의가 필요한 가정이라 사람이 봐야 하고,
+            추천제한·이용제한은 정책상 추천 자체를 막은 고객.
+            ObservationLevel enum (app-server domain/account/model/ObservationLevel.java).
 
         candidates.py 라우트와 동일한 필드 풀 셀렉트 → 호출자는 _parse_schedule /
         list_candidate_teachers 로 그대로 넘길 수 있음. list_candidate_teachers 가
@@ -969,10 +1027,16 @@ class JarandaReplica:
                 WHERE rt.recommendation_sid = r.sid
                   AND rt.requested = 1
               )
+              AND (
+                SELECT COUNT(DISTINCT rt.teacher_account_sid)
+                  FROM recommendation_teachers rt
+                 WHERE rt.recommendation_sid = r.sid
+                   AND (rt.applied = 1 OR rt.accepted = 1)
+              ) <= 1
               AND NOT EXISTS (
-                SELECT 1 FROM recommendation_teachers rt
-                WHERE rt.recommendation_sid = r.sid
-                  AND (rt.applied = 1 OR rt.accepted = 1)
+                SELECT 1 FROM account pa
+                WHERE pa.sid = r.parent_account_sid
+                  AND pa.observation_level IN (9, 90, 99)
               )
             ORDER BY r.created_at ASC
             LIMIT :limit
