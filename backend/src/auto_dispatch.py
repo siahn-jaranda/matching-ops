@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -460,6 +461,8 @@ async def _process_one(
                 "current": current, "variant": variant}
 
     payload = _build_input(app, cand_views, wage_types)
+    used_fallback = False
+    fallback_cause = ""
     try:
         raw_text, parsed, in_tok, out_tok = await llm.generate_recommendation(
             payload,
@@ -474,22 +477,31 @@ async def _process_one(
             )
     except Exception as e:
         logger.exception("auto_dispatch LLM call failed sid=%s", sid)
-        await store.record_run(
-            recommendation_sid=sid, dry_run=dry_run,
-            pool_size=len(filtered), added_count=0, succeed_count=0, denied_count=0,
-            llm_model_id=settings.llm_recommend_model_id,
-            operator_email=operator_email,
-            error_message=f"llm_failed: {e!s}"[:1000],
-            variant=variant,
-            pre_responder_count=pre_resp,
-            added_teacher_sids=top_sids or None,
-        )
-        return {"sid": sid, "status": "error", "error": "llm_failed", "variant": variant}
+        if not settings.auto_dispatch_llm_fallback_enabled:
+            await store.record_run(
+                recommendation_sid=sid, dry_run=dry_run,
+                pool_size=len(filtered), added_count=0, succeed_count=0, denied_count=0,
+                llm_model_id=settings.llm_recommend_model_id,
+                operator_email=operator_email,
+                error_message=f"llm_failed: {e!s}"[:1000],
+                variant=variant,
+                pre_responder_count=pre_resp,
+                added_teacher_sids=top_sids or None,
+            )
+            return {"sid": sid, "status": "error", "error": "llm_failed", "variant": variant}
+        # LLM 이 죽어도 멈추지 않는다 — 규칙 랭킹으로 계속한다.
+        # 0건으로 3주를 보내는 것보다 덜 정교하게라도 도는 편이 낫다.
+        logger.warning("auto_dispatch LLM 실패 → 규칙 랭킹 폴백 sid=%s", sid)
+        used_fallback = True
+        fallback_cause = f"{type(e).__name__}: {e!s}"[:300]
+        parsed = {}
+        in_tok = out_tok = 0
 
-    try:
-        await get_llm_insight_store().add_token_usage(in_tok, out_tok)
-    except Exception:
-        logger.exception("auto_dispatch token_usage persist failed sid=%s (graceful)", sid)
+    if not used_fallback:
+        try:
+            await get_llm_insight_store().add_token_usage(in_tok, out_tok)
+        except Exception:
+            logger.exception("auto_dispatch token_usage persist failed sid=%s (graceful)", sid)
 
     ranked = parsed.get("ranked") or []
     summary = (parsed.get("summary") or "").strip()
@@ -512,6 +524,18 @@ async def _process_one(
         })
         if len(top_items) >= top_n:
             break
+    # LLM 이 죽었거나(폴백) 쓸 만한 sid 를 하나도 못 냈으면 규칙 랭킹으로 대체한다.
+    # 후자는 응답은 왔는데 내용이 비거나 없는 선생님만 지어낸 경우다 — 둘 다
+    # "LLM 을 못 쓴다"는 점에서 같으므로 같은 길로 보낸다.
+    if (used_fallback or not top_items) and settings.auto_dispatch_llm_fallback_enabled:
+        if not used_fallback:
+            used_fallback = True
+            fallback_cause = "llm_returned_empty_ranked"
+            logger.warning("auto_dispatch LLM 응답에 유효 후보 없음 → 규칙 랭킹 폴백 sid=%s", sid)
+        top_items = _fallback_rank(cand_views, want_days, top_n)
+        summary = f"규칙 랭킹(LLM 미사용) — {fallback_cause[:80]}"
+
+    model_id_used = FALLBACK_MODEL_ID if used_fallback else settings.llm_recommend_model_id
     top_sids = [t["teacher_sid"] for t in top_items]
     top_names = [t["name"] for t in top_items]
 
@@ -519,7 +543,7 @@ async def _process_one(
         await store.record_run(
             recommendation_sid=sid, dry_run=dry_run,
             pool_size=len(filtered), added_count=0, succeed_count=0, denied_count=0,
-            llm_model_id=settings.llm_recommend_model_id,
+            llm_model_id=model_id_used,
             operator_email=operator_email,
             error_message="llm_returned_empty_ranked",
             variant=variant,
@@ -539,7 +563,7 @@ async def _process_one(
             recommendation_sid=sid, dry_run=True,
             pool_size=len(filtered), added_count=len(top_sids),
             succeed_count=0, denied_count=0,
-            llm_model_id=settings.llm_recommend_model_id,
+            llm_model_id=model_id_used,
             operator_email=operator_email,
             variant=variant,
             pre_responder_count=pre_resp,
@@ -548,6 +572,7 @@ async def _process_one(
         return {
             "sid": sid, "status": "dry_run",
             "variant": variant,
+            "llm": "fallback" if used_fallback else "llm",
             "pool_size": len(filtered),
             "cooldown_removed": cooldown_removed,
             "top": [{"teacher_sid": s, "name": n} for s, n in zip(top_sids, top_names)],
@@ -566,7 +591,7 @@ async def _process_one(
             recommendation_sid=sid, dry_run=False,
             pool_size=len(filtered), added_count=len(top_sids),
             succeed_count=0, denied_count=0,
-            llm_model_id=settings.llm_recommend_model_id,
+            llm_model_id=model_id_used,
             operator_email=operator_email,
             error_message=err,
             variant=variant,
@@ -623,7 +648,7 @@ async def _process_one(
         recommendation_sid=sid, dry_run=False,
         pool_size=len(filtered), added_count=len(top_sids),
         succeed_count=succeed_count, denied_count=len(denied),
-        llm_model_id=settings.llm_recommend_model_id,
+        llm_model_id=model_id_used,
         operator_email=operator_email,
         error_message=err,
         variant=variant,
@@ -635,6 +660,7 @@ async def _process_one(
         "sid": sid,
         "status": "live" if visit_offers_called and not err else "partial",
         "variant": variant,
+        "llm": "fallback" if used_fallback else "llm",
         "pool_size": len(filtered),
         "cooldown_removed": cooldown_removed,
         "requested": len(top_sids),
@@ -733,6 +759,92 @@ async def _record_dashboard(
     return out
 
 
+FALLBACK_MODEL_ID = "fallback-rule-v1"
+
+
+def _fallback_rank(cand_views: list[dict[str, Any]], want_days: list[str],
+                   top_n: int) -> list[dict[str, Any]]:
+    """LLM 없이 후보를 줄 세운다. LLM 응답과 같은 모양을 돌려준다.
+
+    2026-09-10 Anthropic 사용량 한도가 10/1 까지 막히면서 만들었다. 자동 디스패치가
+    3주간 0건이 되는 것보다는, 정교함을 잃더라도 도는 편이 낫다.
+
+    정렬은 **2단 사전식**이다. 하나의 가중합으로 뭉개지 않는다.
+
+    1순위 — 요청 요일 충족 비율. 이건 품질이 아니라 **가능/불가능 조건**이다.
+      요청 요일에 못 오는 선생님은 경력이 아무리 좋아도 그 수업을 못 한다.
+      가중합에 넣으면 "요일 1/2 + 경력 만점"이 "요일 2/2"를 이겨버린다.
+    2순위 — 품질 점수(아래). 요일이 같을 때만 의미가 있다.
+    3순위 — teacher_sid. 같은 입력이면 항상 같은 순서가 나와야 재시도·재현이 된다.
+
+    품질 점수는 이 프로젝트에서 **실측했거나 LLM 프롬프트가 이미 쓰던 신호만** 넣는다.
+    항목 간 배분에는 효과 크기 근거가 없으므로(랭킹용으로 측정한 적이 없다)
+    비슷한 크기로 두고, 근거가 생기면 그때 조정한다.
+
+    - 과목 경력(15) / 전체 경력(10) — R1 이 200h 로 이미 거른 뒤의 정도 차이.
+    - 추천율(15) — R2 가 80% 로 거른 뒤라 80~100 구간을 0~15 로 편다.
+    - 리뷰 수(5) — 추천율의 신뢰도. 30건에서 만점.
+    - 담당 아이 수(-10) — 많으면 여력이 없다. LLM 프롬프트도 같은 지침을 준다.
+    - 지각(-5)
+
+    🚨 시급은 넣지 않는다. A1 조사에서 부모 상한을 넘는 선생님의 수락률이 오히려
+    2.4~3.4배 높았다 — 방향을 확신할 수 없는 신호를 점수에 넣으면 안 된다.
+    """
+    n_want = len(want_days)
+
+    def _day_ratio(c: dict[str, Any]) -> float:
+        # 부모가 요일을 안 적었으면 이 축은 변별력이 없다 — 전원 동점으로 두고
+        # 품질 점수가 순위를 정하게 한다.
+        if not n_want:
+            return 1.0
+        return min(len(c.get("day_match") or []) / n_want, 1.0)
+
+    def _score(c: dict[str, Any]) -> float:
+        rate = c.get("recommend_rate")
+        rate_pt = 0.0 if rate is None else max(0.0, min((float(rate) - 80.0) / 20.0, 1.0))
+        return (
+            15.0 * min(float(c.get("subject_exp_hours") or 0) / 200.0, 1.0)
+            + 10.0 * min(float(c.get("exp_hours") or 0) / 500.0, 1.0)
+            + 15.0 * rate_pt
+            + 5.0 * min(int(c.get("reviews") or 0) / 30.0, 1.0)
+            - 10.0 * min(int(c.get("active_kids") or 0) / 5.0, 1.0)
+            - 5.0 * min(int(c.get("lateness") or 0) / 3.0, 1.0)
+        )
+
+    def _reason(c: dict[str, Any], sc: float) -> str:
+        bits = []
+        dm = c.get("day_match") or []
+        if not n_want:
+            bits.append("요일 조건 없음")
+        else:
+            bits.append("요일 " + (f"{len(dm)}/{n_want}" if dm else "0/%d·확인필요" % n_want))
+        if c.get("subject_exp_hours"):
+            bits.append(f"과목경력 {int(c['subject_exp_hours'])}h")
+        if c.get("recommend_rate") is not None:
+            bits.append(f"추천율 {c['recommend_rate']}%({c.get('reviews') or 0}건)")
+        if c.get("active_kids"):
+            bits.append(f"담당 {c['active_kids']}명")
+        return " · ".join(bits) + f" · 점수 {sc:.0f}"
+
+    scored = sorted(
+        ((_day_ratio(c), _score(c), str(c.get("teacher_sid") or ""), c) for c in cand_views),
+        key=lambda t: (-t[0], -t[1], t[2]),
+    )
+    out: list[dict[str, Any]] = []
+    for i, (_dr, sc, tsid, c) in enumerate(scored[:top_n], start=1):
+        if not tsid:
+            continue
+        out.append({
+            "teacher_sid": tsid,
+            "name": str(c.get("name") or ""),
+            "rank": i,
+            "reason": _reason(c, sc),
+            "caution": "" if (not n_want or c.get("day_match"))
+                       else "요청 요일과 겹치지 않음 — 일정 조율 필요",
+        })
+    return out
+
+
 def _make_summary(
     *,
     dry_run: bool,
@@ -752,6 +864,7 @@ def _make_summary(
         by_status[p["status"]] = by_status.get(p["status"], 0) + 1
     total_succeed = sum(int(p.get("succeed_count") or 0) for p in processed)
     total_denied = sum(int(p.get("denied_count") or 0) for p in processed)
+    fallback_used = sum(1 for p in processed if p.get("llm") == "fallback")
     return {
         "dry_run": dry_run,
         "started_at": started_at.isoformat(),
@@ -762,6 +875,7 @@ def _make_summary(
         "raw_candidates": raw,
         "excluded": excluded,
         "eligible": eligible,
+        "llm_fallback_used": fallback_used,
         "effective_targets": effective_targets,
         "skipped_reason": skipped_reason,
         "by_status": by_status,
@@ -769,6 +883,42 @@ def _make_summary(
         "total_denied_teachers": total_denied,
         "details": processed,
     }
+
+
+# 폴백 알림은 매 실행마다 보내면 10분마다 울린다. 한 시간에 한 번으로 묶는다.
+_FALLBACK_NOTICE_AT = 0.0
+
+
+async def _post_fallback_notice(n: int, summary: dict[str, Any]) -> None:
+    """LLM 대신 규칙 랭킹으로 처리했음을 알린다. 실패해도 본류에 영향 없다."""
+    global _FALLBACK_NOTICE_AT
+    now = time.monotonic()
+    if now - _FALLBACK_NOTICE_AT < 3600:
+        return
+    url = (settings.ab_report_webhook or settings.auto_dispatch_slack_webhook).strip()
+    if not url:
+        logger.warning("LLM 폴백 %d건 처리 — 알림 웹훅 미설정이라 로그만 남김", n)
+        _FALLBACK_NOTICE_AT = now
+        return
+    text_body = (
+        "⚠️ *matching-ops 자동 디스패치 — LLM 없이 규칙 랭킹으로 처리 중*\n"
+        "이번 실행에서 %d건을 `%s` 로 처리했습니다. LLM 랭킹이 아니라 "
+        "요일·경력·추천율 기반 결정적 순위입니다.\n"
+        "_Anthropic API 가 복구되면 자동으로 LLM 랭킹으로 돌아갑니다. "
+        "이 알림은 1시간에 한 번만 보냅니다._"
+    ) % (n, FALLBACK_MODEL_ID)
+    payload: dict[str, Any] = {"text": text_body}
+    target = settings.ab_report_slack_target.strip()
+    if target and url == settings.ab_report_webhook.strip():
+        payload["channel"] = target
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code >= 400:
+            logger.error("fallback notice webhook %s %s", r.status_code, r.text[:200])
+    except Exception:
+        logger.exception("fallback notice post failed (graceful)")
+    _FALLBACK_NOTICE_AT = now
 
 
 async def _maybe_alert_llm_failures(
@@ -786,6 +936,12 @@ async def _maybe_alert_llm_failures(
     """
     if summary.get("dry_run"):
         return  # dry_run 기록은 통계에서 제외되므로 연속 카운트가 무의미
+
+    # 폴백으로 돌면 error_message 가 llm_failed 로 남지 않는다. 그대로 두면
+    # "LLM 이 죽었는데 아무도 모르는" 상태가 되므로 여기서 따로 알린다.
+    n_fb = int(summary.get("llm_fallback_used") or 0)
+    if n_fb:
+        await _post_fallback_notice(n_fb, summary)
     if not any(r.get("error") == "llm_failed" for r in processed):
         return
     threshold = settings.llm_failure_alert_threshold

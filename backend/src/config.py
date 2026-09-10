@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # 실패 건 재시도 (2026-09-04 Anthropic 한도 소진 사고 대응)
     auto_dispatch_max_attempts: int = 4         # 이 횟수 도달하면 재시도 중단
     auto_dispatch_retry_after_minutes: int = 360  # 실패 후 재시도까지 대기 (6시간)
+    # LLM 이 죽었을 때 규칙 랭킹으로 계속할지. 끄면 예전처럼 llm_failed 로 남기고 멈춘다.
+    # 2026-09-10 Anthropic 사용량 한도가 10/1 까지 막히며 켰다 — 3주간 0건보다는 낫다.
+    auto_dispatch_llm_fallback_enabled: bool = True
+
     # LLM 연속 실패 알림 — 최근 실행이 연속 N건 llm_failed 면 슬랙 통보.
     # 재알림은 (연속수 - 임계값) % alert_repeat_every == 0 일 때만 → 10분 cron 기준 1시간 간격.
     llm_failure_alert_threshold: int = 3
