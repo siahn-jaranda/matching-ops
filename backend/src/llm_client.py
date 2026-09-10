@@ -2,6 +2,12 @@
 
 system prompt를 cache_control로 마킹 → 반복 호출 시 입력 토큰 비용 절감.
 응답은 JSON 객체. 파싱 실패 시 response_json={} 반환 (raw text는 그대로 보존).
+
+키 폴백 — ANTHROPIC_API_KEY_FALLBACK 이 설정돼 있으면 주 키가 사용량 한도·과금·
+429·529 로 실패했을 때 보조 키로 1회 재시도한다. 2026-09-04 09:40~11:50 KST 에
+주 키가 "You have reached your specified API usage limits" 로 막혀 자동 디스패치
+LLM 랭킹이 6건 연속 실패한 사고 대응. 사용량 한도는 **조직 단위**라 보조 키는
+반드시 별도 조직(자체 결제)의 키여야 한다 — 같은 조직의 두 번째 키는 함께 죽는다.
 """
 from __future__ import annotations
 
@@ -84,6 +90,10 @@ AUTO_DISPATCH_SYSTEM_PROMPT = """당신은 자란다 매칭 운영팀의 '자동
 - 추천 사유는 반드시 입력 데이터(경력시간, 자기소개, 평가/추천율, 가용요일,
   현재 담당 아이 수, 시급)에 근거하세요. 담당 아이가 너무 많으면 여력 부족으로 감점,
   추천율이 높으면 가점.
+- application.parent_wage_preference 는 부모가 고른 희망 시급대입니다.
+  **탈락 기준으로 쓰지 마세요.** 실측상 희망 상한을 넘는 선생님의 수락률이 오히려
+  2~3배 높습니다. 상한을 크게 넘으면서 경력·추천율에 뚜렷한 강점이 없을 때만
+  소폭 감점하세요. 상한 이하 후보만으로 20명을 채우려 하지 마세요.
 
 엄격한 규칙:
 - 입력 candidates 배열에 있는 teacher_sid만 사용하세요. 새 선생님을 지어내지 마세요.
@@ -170,14 +180,67 @@ RECOVERY_SYSTEM_PROMPT = """당신은 자란다 매칭 운영팀의 '지역 회�
 ranked는 추천 우선순위 상위 5~7명만. 요일 불가 후보는 넣더라도 하위로."""
 
 
+# 보조 키로 넘길 만한 오류 메시지 조각 (400/403 은 상태코드만으로는 구분 불가).
+_FAILOVER_HINTS = ("usage limit", "credit balance", "quota", "billing", "spend limit")
+
+
+def is_failover_error(exc: BaseException) -> bool:
+    """보조 키로 재시도할 가치가 있는 오류인가.
+
+    - 429 RateLimitError / 529 overloaded → 무조건
+    - 400·403 은 프롬프트 오류일 수도 있어 메시지에 한도·과금 힌트가 있을 때만.
+      (한도 소진은 400 invalid_request_error 로 온다)
+    """
+    if isinstance(exc, anthropic.RateLimitError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in (429, 529):
+        return True
+    if status in (400, 403):
+        msg = str(exc).lower()
+        return any(h in msg for h in _FAILOVER_HINTS)
+    return False
+
+
 class LlmClient:
     def __init__(self, api_key: str | None = None) -> None:
         key = api_key or settings.anthropic_api_key
         if not key:
             raise RuntimeError("ANTHROPIC_API_KEY 미설정")
         self._client = anthropic.AsyncAnthropic(api_key=key)
+        fallback_key = settings.anthropic_api_key_fallback.strip()
+        # 주 키와 같은 값이면 폴백이 아니다 (설정 실수 방어)
+        self._fallback = (
+            anthropic.AsyncAnthropic(api_key=fallback_key)
+            if fallback_key and fallback_key != key
+            else None
+        )
         self._model = settings.llm_model_id
         self._max_tokens = settings.llm_max_tokens
+
+    @property
+    def has_fallback(self) -> bool:
+        return self._fallback is not None
+
+    async def _create(self, **kwargs: Any) -> Any:
+        """messages.create + 보조 키 폴백.
+
+        SDK는 4xx를 재시도하지 않으므로 여기서 직접 넘긴다.
+        보조 키까지 실패하면 **보조 키의 예외**를 올린다 — 둘 다 죽은 상황에서
+        마지막으로 본 오류가 더 유용하다.
+        """
+        try:
+            return await self._client.messages.create(**kwargs)
+        except Exception as e:
+            if self._fallback is None or not is_failover_error(e):
+                raise
+            logger.warning(
+                "LLM 주 키 실패 → 보조 키로 재시도 (%s: %s)",
+                type(e).__name__, str(e)[:200],
+            )
+            res = await self._fallback.messages.create(**kwargs)
+            logger.warning("LLM 보조 키로 처리 성공 model=%s", kwargs.get("model"))
+            return res
 
     async def generate_recommendation(
         self, input_context: dict[str, Any], max_tokens: int = 1024,
@@ -186,7 +249,7 @@ class LlmClient:
         """후보 추천. system_prompt 미지정 시 RECOMMEND_SYSTEM_PROMPT
         (지역 회수는 RECOVERY_SYSTEM_PROMPT 전달). (raw_text, parsed, in_tok, out_tok)."""
         user_msg = json.dumps(input_context, ensure_ascii=False, default=_json_default)
-        response = await self._client.messages.create(
+        response = await self._create(
             model=settings.llm_recommend_model_id,
             max_tokens=max_tokens,
             system=[
@@ -211,7 +274,7 @@ class LlmClient:
     ) -> tuple[str, dict[str, Any], int, int]:
         """LLM 호출. (raw_text, parsed_json, input_tokens, output_tokens) 반환."""
         user_msg = json.dumps(input_context, ensure_ascii=False, default=_json_default)
-        response = await self._client.messages.create(
+        response = await self._create(
             model=self._model,
             max_tokens=self._max_tokens,
             system=[

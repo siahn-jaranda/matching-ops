@@ -42,6 +42,30 @@ input, textarea, select { font-family: inherit; }
   font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 4px;
   background: #EEF1F4; color: #4B5563; letter-spacing: 0.04em;
 }
+.mo-filterbar {
+  display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+  padding: 10px 12px; margin: 0 0 4px;
+  background: #F7F8FA; border: 1px solid #E7EAF0; border-radius: 8px;
+}
+.mo-fgroup { display: flex; gap: 5px; align-items: center; }
+.mo-flabel {
+  font-size: 11px; font-weight: 700; color: #8A93A5;
+  letter-spacing: .03em; margin-right: 2px; white-space: nowrap;
+}
+.mo-chip {
+  font-size: 12px; font-weight: 500; color: #4A5567; cursor: pointer;
+  background: #FFF; border: 1px solid #D9DEE7; border-radius: 999px;
+  padding: 4px 10px; white-space: nowrap; font-family: inherit;
+  display: inline-flex; align-items: baseline; gap: 5px;
+}
+.mo-chip:hover:not(:disabled) { border-color: #B9C1CF; }
+.mo-chip .n { font-size: 10.5px; opacity: .55; font-variant-numeric: tabular-nums; }
+.mo-chip.on { background: #2F5FD8; border-color: #2F5FD8; color: #FFF; font-weight: 600; }
+.mo-chip.on .n { opacity: .75; }
+.mo-chip.dim { opacity: .42; cursor: default; }
+.mo-chip.reset { color: #B4232B; border-color: #EBC7C9; background: #FDF3F3; font-weight: 600; }
+.mo-chip:focus-visible { outline: 2px solid #2F5FD8; outline-offset: 2px; }
+
 .tabs {
   display: flex; gap: 4px; padding: 4px;
   background: #F4F6F8; border-radius: 10px;
@@ -690,6 +714,7 @@ input, textarea, select { font-family: inherit; }
       <nav class="tabs">
         <button class="btn-tab active" data-tab="matching" onclick="switchTab('matching')">신청서 목록</button>
         <button class="btn-tab" data-tab="managed" onclick="switchTab('managed')">관리 신청서 목록</button>
+        <button class="btn-tab" data-tab="manual" onclick="switchTab('manual')">수동관리 신청서</button>
         <button class="btn-tab" data-tab="insight" onclick="switchTab('insight')">인사이트 도출</button>
       </nav>
     </div>
@@ -777,6 +802,32 @@ input, textarea, select { font-family: inherit; }
     <div class="list-grid" id="managed-list-grid">
       <div id="managed-list-area"></div>
       <div id="managed-detail-area"></div>
+    </div>
+  </main>
+
+  <main id="page-manual" class="main-pad" style="display:none">
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <div style="display:flex;align-items:baseline;gap:8px">
+          <span class="title">수동관리 신청서</span>
+          <span class="count-chip" id="manual-count-chip">0건</span>
+        </div>
+        <div class="divider-v"></div>
+        <span style="font-size:12.5px;color:#6B7280" id="manual-sub">플래너가 위에서부터 처리하는 우선순위 목록</span>
+      </div>
+      <div class="toolbar-left" style="gap:10px">
+        <button class="btn btn-secondary" onclick="loadManualOps(null, true)"><span class="icon">&#8635;</span>새로고침</button>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin:0 0 12px">
+      <button class="btn-tab active" data-menu="recommended" onclick="switchManualMenu('recommended')">선생님 추천 상태 신청서</button>
+      <button class="btn-tab" data-menu="intake" onclick="switchManualMenu('intake')">접수안내 신청서</button>
+    </div>
+
+    <div class="list-grid" id="manual-list-grid">
+      <div id="manual-list-area"></div>
+      <div id="manual-detail-area"></div>
     </div>
   </main>
 
@@ -1172,6 +1223,8 @@ function backendToApp(r) {
     reRecommend: !!r.reRecommend,
     // 처리 담당 — backend matching_ops_handler 테이블에서 batch 주입 (없으면 null)
     handler: r.handler || null,
+    // 수동관리 그룹 태그(waiting|low). 다른 목록에서는 undefined.
+    opsGroup: r.opsGroup || null,
     // 메모 카운트 — matching_ops_memo 활성 row 집계. renderCardView가 "💬 메모 N건" 표시.
     memoCount: r.memoCount || 0,
     lastMemoAt: r.lastMemoAt || null,
@@ -1437,6 +1490,214 @@ function renderManaged() {
   listArea.innerHTML = renderCardView(MANAGED);
   // 상세 패널 — 메인과 동일하게 selectedId 기준
   const sel = MANAGED.find(a => a.id === state.selectedId) || null;
+  detailArea.innerHTML = renderDetailPanel(sel);
+}
+
+// ====== 수동관리 신청서 ======
+// 두 메뉴. 우선순위는 필터가 아니라 배경 정렬 — 응답은 이미 정렬된 순서로 온다.
+// 그 순서를 프론트에서 다시 정렬하면 백엔드가 정한 우선순위가 무너진다.
+let MANUAL = { menu: 'recommended', groups: [], rows: [], loadedAt: 0, loading: false };
+
+const MANUAL_GROUP_TONE = { waiting: '#B45309', low: '#B91C1C', stale: '#B45309' };
+
+// 필터는 서버가 아니라 여기서 건다. 목록이 15~60건이라 왕복할 이유가 없고,
+// 칩에 실시간 건수를 같이 보여줄 수 있다. 메뉴를 바꿔도 고른 조합은 유지된다.
+// 값 = null 이면 그 축은 '전체'.
+const MANUAL_FILTER_DEFAULT = {
+  handler: null,   // 'mine' | 'none'
+  viewed:  null,   // 'none' | 'some' | 'all'
+  sido:    null,   // '서울' | '경기' | ...
+  due:     null,   // 'h24' | 'd3'
+  subject: null,   // 과목명
+  parent:  null,   // 'new' | 'rebook'
+};
+let MANUAL_FILTER = { ...MANUAL_FILTER_DEFAULT };
+
+// 카드의 '프로필 n/m' 과 같은 기준으로 센다 — 화면 표기와 필터가 어긋나면 안 된다.
+function manualViewedState(a) {
+  const ts = [a.t1, a.t2].filter(t => t && t.name && t.name !== '—');
+  if (!ts.length) return null;
+  const v = ts.filter(t => t.viewed).length;
+  return v === 0 ? 'none' : v === ts.length ? 'all' : 'some';
+}
+function manualSido(a) { return (a.region || '').split(' ')[0] || ''; }
+function manualSubjects(a) { return (a.subjects || []).map(s => s.name).filter(Boolean); }
+
+const MANUAL_FILTER_TEST = {
+  handler: (a, v) => v === 'mine' ? isMyHandler(a) : !handlerOf(a),
+  viewed:  (a, v) => manualViewedState(a) === v,
+  sido:    (a, v) => manualSido(a) === v,
+  due:     (a, v) => typeof a.timerMin === 'number' && a.timerMin <= (v === 'h24' ? 1440 : 4320),
+  subject: (a, v) => manualSubjects(a).includes(v),
+  parent:  (a, v) => v === 'new' ? a.parentTag === '신규 부모님' : a.parentTag === '기존 부모님',
+};
+
+function manualPasses(a, filter) {
+  return Object.keys(filter).every(k => {
+    const v = filter[k];
+    return v === null || MANUAL_FILTER_TEST[k](a, v);
+  });
+}
+
+// 어떤 축의 후보 건수는 **그 축을 뺀** 나머지 필터를 적용한 뒤 센다.
+// 자기 자신까지 걸고 세면 고르지 않은 값이 전부 0으로 보여 고를 수가 없다.
+function manualCountFor(apps, axis, value) {
+  const rest = { ...MANUAL_FILTER, [axis]: null };
+  return apps.filter(a => manualPasses(a, rest) && MANUAL_FILTER_TEST[axis](a, value)).length;
+}
+
+function setManualFilter(axis, value) {
+  MANUAL_FILTER[axis] = (MANUAL_FILTER[axis] === value) ? null : value;
+  renderManual();
+}
+function resetManualFilter() {
+  MANUAL_FILTER = { ...MANUAL_FILTER_DEFAULT };
+  renderManual();
+}
+
+function manualChip(axis, value, label, n) {
+  const on = MANUAL_FILTER[axis] === value;
+  const dim = !on && n === 0;
+  return `<button class="mo-chip${on ? ' on' : ''}${dim ? ' dim' : ''}"
+    onclick="setManualFilter('${axis}','${String(value).replace(/'/g, "\\'")}')"
+    ${dim ? 'disabled' : ''}>${escapeHtml(label)}<span class="n">${n}</span></button>`;
+}
+
+function renderManualFilters(apps) {
+  const sidos = [...new Set(apps.map(manualSido).filter(Boolean))].sort();
+  const subjects = [...new Set(apps.flatMap(manualSubjects))].sort();
+  const g = (label, chips) =>
+    `<div class="mo-fgroup"><span class="mo-flabel">${label}</span>${chips.join('')}</div>`;
+
+  const parts = [
+    g('담당', [
+      manualChip('handler', 'mine', '내 담당', manualCountFor(apps, 'handler', 'mine')),
+      manualChip('handler', 'none', '미지정', manualCountFor(apps, 'handler', 'none')),
+    ]),
+    g('부모 열람', [
+      manualChip('viewed', 'none', '0건', manualCountFor(apps, 'viewed', 'none')),
+      manualChip('viewed', 'some', '일부', manualCountFor(apps, 'viewed', 'some')),
+      manualChip('viewed', 'all', '전부', manualCountFor(apps, 'viewed', 'all')),
+    ]),
+    g('마감', [
+      manualChip('due', 'h24', '24시간', manualCountFor(apps, 'due', 'h24')),
+      manualChip('due', 'd3', '3일', manualCountFor(apps, 'due', 'd3')),
+    ]),
+    g('부모', [
+      manualChip('parent', 'new', '신규', manualCountFor(apps, 'parent', 'new')),
+      manualChip('parent', 'rebook', '재이용', manualCountFor(apps, 'parent', 'rebook')),
+    ]),
+  ];
+  if (sidos.length > 1) {
+    parts.push(g('지역', sidos.map(v => manualChip('sido', v, v, manualCountFor(apps, 'sido', v)))));
+  }
+  if (subjects.length > 1) {
+    parts.push(g('과목', subjects.map(v => manualChip('subject', v, v, manualCountFor(apps, 'subject', v)))));
+  }
+  const active = Object.values(MANUAL_FILTER).filter(v => v !== null).length;
+  if (active) {
+    parts.push(`<button class="mo-chip reset" onclick="resetManualFilter()">필터 해제 ${active}</button>`);
+  }
+  return `<div class="mo-filterbar">${parts.join('')}</div>`;
+}
+
+function switchManualMenu(menu) {
+  if (MANUAL.menu === menu && MANUAL.rows.length) return;
+  MANUAL.menu = menu;
+  document.querySelectorAll('#page-manual .btn-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.menu === menu));
+  MANUAL.rows = [];
+  MANUAL.groups = [];
+  loadManualOps(menu, true);
+}
+
+async function loadManualOps(menu, force) {
+  if (!authToken) { showGate(); return; }
+  const m = menu || MANUAL.menu;
+  if (!force && MANUAL.menu === m && Date.now() - MANUAL.loadedAt < 10000) { renderManual(); return; }
+  MANUAL.menu = m;
+  MANUAL.loading = true;
+  renderManual();
+  try {
+    const r = await fetch(API_BASE + '/api/manual-ops?menu=' + encodeURIComponent(m), {
+      headers: {'Authorization': 'Bearer ' + authToken},
+    });
+    if (r.status === 401) { showGate('세션이 만료되었습니다. 다시 로그인해주세요.'); return; }
+    if (!r.ok) throw new Error('manual-ops ' + r.status);
+    const data = await r.json();
+    MANUAL.groups = data.groups || [];
+    MANUAL.rows = data.rows || [];
+    MANUAL.poolSize = data.poolSize || 0;
+    MANUAL.loadedAt = Date.now();
+    MANUAL.loading = false;
+    renderManual();
+  } catch (e) {
+    MANUAL.loading = false;
+    console.warn('manual-ops fetch failed:', e.message);
+    document.getElementById('manual-list-area').innerHTML =
+      `<div class="empty-feed">수동관리 목록을 불러오지 못했습니다 (${escapeHtml(e.message)}).</div>`;
+  }
+}
+
+function manualGroupHeader(g) {
+  const tone = MANUAL_GROUP_TONE[g.key] || '#374151';
+  return `<div style="display:flex;align-items:baseline;gap:8px;margin:18px 0 8px;padding-left:2px">
+    <span style="font-size:13.5px;font-weight:800;color:${tone}">${escapeHtml(g.label)}</span>
+    <span class="count-chip">${g.count}건</span>
+    <span style="font-size:12px;color:#6B7280">${escapeHtml(g.hint || '')}</span>
+  </div>`;
+}
+
+function renderManual() {
+  const listArea = document.getElementById('manual-list-area');
+  const detailArea = document.getElementById('manual-detail-area');
+  const chip = document.getElementById('manual-count-chip');
+  const sub = document.getElementById('manual-sub');
+  if (!listArea) return;
+
+  if (MANUAL.loading && !MANUAL.rows.length) {
+    chip.textContent = '불러오는 중';
+    listArea.innerHTML = renderSkeletonCards(4);
+    detailArea.innerHTML = '';
+    return;
+  }
+
+  // 필터는 매핑된 app 기준으로 건다 — 카드 표기와 같은 값을 봐야 어긋나지 않는다.
+  const all = MANUAL.rows.map(backendToApp);
+  const kept = all.filter(a => manualPasses(a, MANUAL_FILTER));
+  const filtered = kept.length !== all.length;
+
+  chip.textContent = filtered ? `${kept.length} / ${all.length}건` : `${all.length}건`;
+  sub.textContent = MANUAL.menu === 'intake'
+    ? `접수안내 ${MANUAL.poolSize || 0}건 중 처리 대상`
+    : '선생님을 추천했는데 부모님 확정이 없는 건 — 오래된 순';
+
+  if (!all.length) {
+    listArea.innerHTML = `<div class="empty-feed">지금 처리할 신청서가 없습니다.</div>`;
+    detailArea.innerHTML = '';
+    return;
+  }
+
+  const parts = [renderManualFilters(all)];
+  if (!kept.length) {
+    parts.push(`<div class="empty-feed">조건에 맞는 신청서가 없습니다. 필터를 줄여보세요.</div>`);
+  } else if (MANUAL.groups.length > 1) {
+    // 그룹 헤더 건수는 필터를 통과한 것만 센다 — 헤더와 아래 목록이 달라 보이면 안 된다.
+    MANUAL.groups.forEach(g => {
+      const rows = kept.filter(a => a.opsGroup === g.key);
+      if (!rows.length) return;
+      parts.push(manualGroupHeader({ ...g, count: rows.length }));
+      parts.push(renderCardView(rows));
+    });
+  } else {
+    if (MANUAL.groups.length === 1) {
+      parts.push(manualGroupHeader({ ...MANUAL.groups[0], count: kept.length }));
+    }
+    parts.push(renderCardView(kept));
+  }
+  listArea.innerHTML = parts.join('');
+
+  const sel = kept.find(a => a.id === state.selectedId) || null;
   detailArea.innerHTML = renderDetailPanel(sel);
 }
 
@@ -2161,6 +2422,8 @@ function selectApp(id) {
   // 관리 탭: 자체 renderManaged 가 상세 패널 처리. 메인 탭: render().
   if (state.tab === 'managed') {
     renderManaged();
+  } else if (state.tab === 'manual') {
+    renderManual();
   } else {
     render();
   }
@@ -2192,8 +2455,10 @@ function switchTab(t) {
   document.querySelectorAll('.tabs .btn-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   document.getElementById('page-matching').style.display = t === 'matching' ? '' : 'none';
   document.getElementById('page-managed').style.display = t === 'managed' ? '' : 'none';
+  document.getElementById('page-manual').style.display = t === 'manual' ? '' : 'none';
   document.getElementById('page-insight').style.display = t === 'insight' ? '' : 'none';
   if (t === 'managed') loadManagedData();
+  if (t === 'manual') loadManualOps();
   if (t === 'insight') loadInsightOptions();
 }
 

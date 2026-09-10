@@ -32,6 +32,11 @@ class Settings(BaseSettings):
 
     # LLM 인사이트 — Anthropic Claude Sonnet 4.6. 키 미설정 시 인사이트 API 비활성.
     anthropic_api_key: str = ""
+    # 보조 키 — 주 키가 사용량 한도/과금/429/529 로 실패하면 이 키로 1회 재시도.
+    # 별도 Anthropic 조직(자체 결제)의 키여야 의미가 있다. 같은 조직의 키는
+    # 한도가 조직 단위라 함께 죽는다 (2026-09-04 09:40~11:50 KST 사고).
+    # 빈 값이면 폴백 없이 기존과 완전히 동일하게 동작한다.
+    anthropic_api_key_fallback: str = ""
     llm_model_id: str = "claude-sonnet-4-6"
     # 지원0 추천·지역 회수 전용 모델. 인사이트(llm_model_id)와 분리해 LLM_MODEL_ID 오버라이드 영향 안 받음 (WELL2-100).
     llm_recommend_model_id: str = "claude-sonnet-4-6"
@@ -67,6 +72,47 @@ class Settings(BaseSettings):
     auto_dispatch_admin_emails: str = ""        # 수동 트리거 허용 운영자 (쉼표 구분). 빈 값=모두 허용
     auto_dispatch_slack_webhook: str = ""       # 슬랙 알림 URL (옵션)
     auto_dispatch_trigger_secret: str = ""      # X-Trigger-Secret 헤더 우회 (CLI·Cloud Scheduler용)
+    # 실패 건 재시도 (2026-09-04 Anthropic 한도 소진 사고 대응)
+    auto_dispatch_max_attempts: int = 4         # 이 횟수 도달하면 재시도 중단
+    auto_dispatch_retry_after_minutes: int = 360  # 실패 후 재시도까지 대기 (6시간)
+    # LLM 이 죽었을 때 규칙 랭킹으로 계속할지. 끄면 예전처럼 llm_failed 로 남기고 멈춘다.
+    # 2026-09-10 Anthropic 사용량 한도가 10/1 까지 막히며 켰다 — 3주간 0건보다는 낫다.
+    auto_dispatch_llm_fallback_enabled: bool = True
+
+    # LLM 연속 실패 알림 — 최근 실행이 연속 N건 llm_failed 면 슬랙 통보.
+    # 재알림은 (연속수 - 임계값) % alert_repeat_every == 0 일 때만 → 10분 cron 기준 1시간 간격.
+    llm_failure_alert_threshold: int = 3
+    llm_failure_alert_repeat_every: int = 6
+
+    # 예상 매칭확률 비율표 (Cloud Scheduler → POST /api/prob-rate/refresh)
+    # 학습창 90일 — 2026-07-02 자동 디스패치 승격 같은 개입을 몇 주 안에 흡수해야 한다.
+    # 정착 30일 — 결과가 여물 시간을 안 주면 최근 건이 전부 미매칭으로 잡혀 비율이 깎인다.
+    prob_rate_window_days: int = 90
+    # 정착 10일 — 매칭 실측이 99.5%가 3일 내, 100%가 7일 내 확정된다(2,200건 기준).
+    # 나이 5~12일 코호트 매칭률 15.8% vs 46~60일 17.8% 로 이미 같은 수준이다.
+    # 30일은 20일을 그냥 버리는 것이고, 그만큼 개입(예: 자동 디스패치 확대) 추종이 늦어진다.
+    prob_rate_settle_days: int = 10
+    # 회귀 감시 — 월 1회 백테스트.
+    # 채점 = 가장 최신 정착 구간 [settle+T, settle], 학습 = 그 **직전** window 길이 구간
+    # [settle+T+window, settle+T]. 둘은 붙어 있을 뿐 겹치지 않는다.
+    #
+    # 겹치면 학습에 쓴 데이터로 채점하게 되어 오차가 실제보다 낮게 나온다.
+    # (2026-09-07: settle 30→10 으로 코호트 span 이 60→80일이 됐는데 lag 를 60 으로
+    #  두어 학습 [150,70] 과 채점 [90,10] 이 20일 겹쳤다. 그래서 lag 고정값을 버리고
+    #  구간을 settle·window 에서 유도한다 — 어느 값을 바꿔도 겹치지 않는다.)
+    prob_rate_audit_test_days: int = 30         # 채점 구간 길이
+    prob_rate_audit_mae_threshold: float = 5.0  # 가중 MAE 가 이걸 넘으면 경보
+    # 채점 표본 150건 — 이보다 얇으면 셀 자체의 95% 표본오차가 ±10%p 안팎이라
+    # 모델 오차와 측정 노이즈를 구분할 수 없다. 30으로 뒀을 때 "15%p 오차"로 보고되던
+    # 셀들이 전부 n=30~66 짜리였고, 실제로는 노이즈 대역 안이었다.
+    prob_rate_audit_min_cell_n: int = 150
+    prob_rate_audit_slack_target: str = "C01S3R69F26"
+
+    # 배포 전/후 비교 일일 리포트 (Cloud Scheduler → Slack n8n 릴레이)
+    ab_report_webhook: str = ""                 # n8n 릴레이 URL. 빈 값이면 발송 안 함(계산만)
+    ab_report_slack_target: str = ""            # Slack 채널 ID 또는 사용자 ID(=DM)
+    ab_report_anchor_kst: str = "2026-09-02 11:57"   # 배포 앵커 (KST, "YYYY-MM-DD HH:MM")
+    ab_report_days: int = 30                    # 이 일수까지만 발송. 마지막 회차는 최종 요약
 
     @property
     def origins_list(self) -> list[str]:

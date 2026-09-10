@@ -20,6 +20,13 @@ from src.db import get_replica
 from src.firestore_chat import find_chat_status, firestore_available
 from src.handler_store import get_handler_store, handler_store_available
 from src.memo_store import get_memo_store, memo_store_available
+from src.prob_rate_store import (
+    age_bucket as prob_age_bucket,
+    cell_key as prob_cell_key,
+    get_prob_rate_store,
+    prob_rate_available,
+    segment as prob_segment,
+)
 
 router = APIRouter(prefix="/api/applications", tags=["applications"])
 logger = logging.getLogger(__name__)
@@ -315,24 +322,60 @@ def _request_chips(rec: dict[str, Any], subjects: list[dict[str, Any]] | None = 
 
 
 def _compute_prob(
+    status_code: Any,
     confirmed: Any,
     cancelled: Any,
     applied_count: int,
     requested_count: int,
-    is_new: bool,
+    is_new: bool | None,
     timer_min: int | None,
     is_urgent: bool,
+    *,
+    seg: str | None = None,
+    age_bucket: str | None = None,
+    rates: dict[tuple[str, str, int, int], tuple[float, int]] | None = None,
 ) -> dict[str, Any]:
     """매칭 확률을 dict로 반환. {value: 0~100, source: heuristic|actual}.
 
+    종결 상태는 status 가 정답이다. 타임스탬프로 판정하면 안 된다 —
+    확정 후 파기된 건은 confirmed_at 과 cancelled_at 이 **둘 다** 실값이라
+    검사 순서에 따라 답이 갈린다(2026-09-07 실측: 정기·일반 225건이 여기 해당,
+    실제 매칭률 6.67% 인데 confirmed 를 먼저 봐서 100% 로 표시되고 있었다).
+    status 로 가르면 40·90 → 100%(실측 1,497건 전부), 99 → 0%(실측 8,748건 전부)로 정확하다.
+
     LLM 예측 미구현 — 휴리스틱: base 30 + 지원 응답률(최대 +45) + 재이용(+10)
     + 지명·요청 모수(최대 +5) + 마감 여유/임박(±15) + 긴급(-10).
-    confirmed/cancelled 시점 정보가 있으면 source=actual로 마킹.
+    ⚠️ 이 휴리스틱은 실측 +48.6%p 과대평가이고 순위도 역전된다. 비율표 모델로 교체 예정
+    (옵시디언 `수동매칭 대시보드/matching-ops 예상 매칭확률 캘리브레이션.md`).
     """
-    if _is_real_ts(confirmed):
+    if status_code in (40, 90):
         return {"value": 100, "source": "actual"}
+    if status_code == 99:
+        return {"value": 0, "source": "actual"}
+    # 종결 status 가 아직 안 붙은 과도 상태 — 취소가 확정을 이긴다
     if _is_real_ts(cancelled):
         return {"value": 0, "source": "actual"}
+    if _is_real_ts(confirmed):
+        return {"value": 100, "source": "actual"}
+
+    # 비율표 조회 — 셀의 과거 실측 매칭률을 그대로 예측값으로 쓴다.
+    # reuse 는 '확인된 재이용'만 1. is_new=None(이력 조회 실패)은 신규로 접지 않고
+    # 상위 셀(reuse=-1)로 보낸다 — 모름을 유리·불리 어느 쪽으로도 밀지 않기 위함.
+    if rates and seg and age_bucket:
+        responder = 1 if applied_count > 0 else 0
+        keys: list[tuple[str, str, int, int]] = []
+        if is_new is not None:
+            # cell_key 를 거쳐야 한다 — reg3·urgent 는 응답유무를 접은 키를 쓴다
+            keys.append(prob_cell_key(seg, age_bucket, 0 if is_new else 1, responder))
+        keys.append((seg, age_bucket, -1, -1))
+        for key in keys:
+            hit = rates.get(key)
+            if hit:
+                rate, n = hit
+                # 상위 셀(reuse=-1)로 떨어졌으면 fallback — 근거 셀이 잎이 아님을 UI 에 알린다
+                return {"value": max(0, min(100, round(rate))),
+                        "source": "empirical" if key[2] != -1 else "fallback",
+                        "n": n, "cell": "/".join(str(x) for x in key)}
 
     score = 30
     if applied_count >= 1:
@@ -344,7 +387,9 @@ def _compute_prob(
     if requested_count >= 3:
         score += 5
 
-    if not is_new:
+    # 확인된 재이용만 가산. is_new=None 은 부모 이력 조회 실패(=모름)이므로 중립.
+    # 예전엔 None 이 False 로 접혀 '재이용' 취급되어 모름에 유리한 점수가 붙었다.
+    if is_new is False:
         score += 10
 
     if timer_min is not None:
@@ -615,6 +660,17 @@ def _to_frontend_teacher(
     }
 
 
+async def _load_rates() -> dict[tuple[str, str, int, int], tuple[float, int]] | None:
+    """비율표 로드. 실패해도 None 을 돌려 휴리스틱으로 흘려보낸다(목록이 죽으면 안 된다)."""
+    if not prob_rate_available():
+        return None
+    try:
+        return await get_prob_rate_store().load()
+    except Exception:
+        logger.exception("prob_rate load failed (graceful)")
+        return None
+
+
 def _to_row(
     rec: dict[str, Any],
     subject_map: dict[int, str],
@@ -629,6 +685,8 @@ def _to_row(
     teacher_availability_map: dict[str, set[str]] | None = None,
     chat_room_map: dict[tuple[str, str], dict[str, Any]] | None = None,
     memo_meta: dict[str, Any] | None = None,
+    *,
+    rates: dict[tuple[str, str, int, int], tuple[float, int]] | None = None,
 ) -> dict[str, Any]:
     """DB row → 페이지 사용 스키마.
 
@@ -660,9 +718,15 @@ def _to_row(
         ca = created_at if created_at.tzinfo else created_at.replace(tzinfo=KST)
         created_at_iso = ca.isoformat()
         created_at_full = ca.strftime("%Y-%m-%d %H:%M")
+        age_min: float | None = (datetime.now(KST) - ca).total_seconds() / 60
     else:
         created_at_iso = None
         created_at_full = "—"
+        age_min = None
+
+    # 비율표 셀 좌표 — 상품군과 신청서 나이구간
+    prob_seg = prob_segment(rec.get("regularity"), rec.get("is_urgent"))
+    prob_bucket = prob_age_bucket(age_min)
 
     charge = rec.get("estimated_charge")
     price_str = f"{int(charge):,}원" if charge else "—"
@@ -725,12 +789,15 @@ def _to_row(
         "confirmed": confirmed.strftime("%H:%M") if _is_real_ts(confirmed) else "—",
         # prob: { value: 0~100, source: heuristic|actual }
         "prob": _compute_prob(
-            confirmed, cancelled,
+            status_code, confirmed, cancelled,
             int(rec.get("applied_count") or 0),
             int(rec.get("requested_count") or 0),
-            bool(is_new) if is_new is not None else False,
+            is_new,
             timer,
             bool(rec.get("is_urgent")),
+            seg=prob_seg,
+            age_bucket=prob_bucket,
+            rates=rates,
         ),
         "result": result,
         "resultType": result_type,
@@ -904,6 +971,8 @@ async def list_applications(
         except Exception:
             logger.exception("memo batch fetch failed (graceful)")
 
+    rates = await _load_rates()
+
     return {
         "count": len(rows),
         "filter": {"from": date_from, "to": date_to, "limit": limit, "offset": offset},
@@ -923,6 +992,7 @@ async def list_applications(
                 teacher_availability_map,
                 chat_room_map,
                 memo_meta_map.get(str(r.get("sid"))),
+                rates=rates,
             )
             for r in rows
         ],
@@ -1035,6 +1105,7 @@ async def get_application(sid: str) -> dict[str, Any]:
         teacher_availability_map,
         chat_room_map,
         memo_meta,
+        rates=await _load_rates(),
     )
 
 

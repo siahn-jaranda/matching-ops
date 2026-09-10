@@ -30,6 +30,44 @@ DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 DOW_KO = {"MONDAY": "mon", "TUESDAY": "tue", "WEDNESDAY": "wed", "THURSDAY": "thu",
           "FRIDAY": "fri", "SATURDAY": "sat", "SUNDAY": "sun"}
 
+# 부모가 신청서에서 고른 희망 시급대 → **선생님** 시급 범위 (원)
+# 정본: jaranda-app-server domain/requestform/desiredcost/DesiredCost.java 의
+#   teacherWageRange (2026-09-02 GitHub 최신본 기준).
+# 🚨 하드필터로 쓰지 않는다. LLM 입력에만 실어 '난이도·선호' 신호로만 쓴다.
+#   실측(2026-09-02): 희망 상한을 넘는 선생님의 수락률이 오히려 2.4~3.4배 높고,
+#   상한으로 자르면 실제 성사 매칭의 31%가 차단된다. 상세는 조사 문서 참고.
+_WAGE_RANGES = {
+    "NONE":                     (0, 100_000),
+    "ALL_WAGE":                 (0, 100_000),
+    "CARE_LEVEL_1":             (0, 12_000),
+    "CARE_LEVEL_2":             (0, 15_000),
+    "CARE_LEVEL_3":             (0, 21_000),
+    "CARE_LEVEL_4":             (0, 31_000),
+    "STUDY_FRIENDLY":           (0, 19_000),
+    "STUDY_MODERATE":           (0, 24_000),
+    "STUDY_EXPERIENCED":        (0, 34_000),
+    "STUDY_PREMIUM":            (0, 100_000),
+    # 아래 4개는 2026-04~05 이관으로 퇴역. 최근 120일 매칭 0~7건. 조회 호환용 유지.
+    "CARE_FRIENDLY":            (0, 16_000),
+    "CARE_VETERAN":             (16_000, 100_000),
+    "STUDY_HIGHLY_EXPERIENCED": (19_000, 29_000),
+    "STUDY_VETERAN":            (29_000, 100_000),
+}
+
+
+def _wage_preference(wage_types: list[str] | None) -> dict[str, Any] | None:
+    """부모 희망 시급대 → LLM 입력용 dict. 모르는 코드는 무시, 여러 개면 합집합."""
+    if not wage_types:
+        return None
+    known = [_WAGE_RANGES[w] for w in wage_types if w in _WAGE_RANGES]
+    if not known:
+        return {"types": list(wage_types), "teacher_wage_won": None}
+    return {
+        "types": list(wage_types),
+        "teacher_wage_won": {"min": min(lo for lo, _ in known),
+                             "max": max(hi for _, hi in known)},
+    }
+
 
 def _parse_schedule(raw: Any) -> dict[str, Any]:
     """recommendation.schedule(JSON) → 신청 요일/시간/시작일/주기."""
@@ -72,7 +110,8 @@ def _candidate_view(c: dict[str, Any], want_days: list[str]) -> dict[str, Any]:
     }
 
 
-def _build_input(app: dict[str, Any], cand_views: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_input(app: dict[str, Any], cand_views: list[dict[str, Any]],
+                 wage_types: list[str] | None = None) -> dict[str, Any]:
     spec = int(app.get("teacher_specialties") or 5)
     sched = _parse_schedule(app.get("schedule"))
     return {
@@ -88,6 +127,7 @@ def _build_input(app: dict[str, Any], cand_views: list[dict[str, Any]]) -> dict[
             "estimated_charge": int(app.get("estimated_charge") or 0),
             "parent_request": app.get("parent_request_to_teacher") or None,
             "preferred_gender": app.get("preferable_teacher_gender") or None,
+            "parent_wage_preference": _wage_preference(wage_types),
             "preferred_traits": app.get("preferable_teacher_characteristics") or None,
             "deadline_at": app.get("deadline_at"),
         },

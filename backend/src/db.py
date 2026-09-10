@@ -433,6 +433,204 @@ class JarandaReplica:
             result = await session.execute(query)
             return {int(row._mapping["id"]): row._mapping["name"] for row in result}
 
+    async def list_manual_ops_sids(
+        self, *, menu: str, stale_hours: int = 48, limit: int = 500
+    ) -> list[str]:
+        """[수동관리 신청서] 두 메뉴의 대상 sid.
+
+        - recommended — 선생님 추천 상태(20)가 된 지 stale_hours 경과.
+          🚨 경과 기준은 created_at 이다. suggested_at 은 추천이 나갈 때마다 **갱신**되어
+          "상태에 진입한 시점"을 못 나타낸다(2026-09-07 실측: status=20 인 21건 전부
+          suggested_at 이 최근 2일 내인데, 그중 15건은 접수 48시간 초과).
+          같은 실측에서 첫 추천 시각(min recommendation_teachers._created_at where
+          suggested=1)이 **21건 전부 created_at 과 동일**했다 — 플랫폼이 접수 즉시
+          선생님을 붙이므로 접수 시각이 곧 추천 상태 진입 시각이다.
+          접수와 추천 사이에 지연이 생기는 구조로 바뀌면 이 기준을 다시 봐야 한다.
+          오래 방치된 순(오름차순)이 곧 처리 우선순위다.
+        - intake — 접수안내(10) 전건. 매칭확률 분위는 라우트에서 자른다.
+          확률 계산이 파이썬 쪽(_compute_prob)이라 SQL 로 자를 수 없고,
+          접수안내는 상시 100건대라 전건을 가져와도 부담이 없다.
+
+        sid 만 돌려주고 본문은 기존 목록 파이프라인(list_recent_recommendations +
+        augment + _to_row)을 그대로 재사용한다 — 카드 스키마를 두 벌 만들지 않으려는 것.
+        """
+        if menu == "recommended":
+            query = text(
+                """
+                SELECT r.sid
+                  FROM recommendation r
+                 WHERE r.status = 20
+                   AND r.created_at <= DATE_SUB(NOW(), INTERVAL :stale_hours HOUR)
+                 ORDER BY r.created_at ASC
+                 LIMIT :limit
+                """
+            )
+            params = {"stale_hours": stale_hours, "limit": limit}
+        else:
+            query = text(
+                """
+                SELECT r.sid
+                  FROM recommendation r
+                 WHERE r.status = 10
+                 ORDER BY r.created_at DESC
+                 LIMIT :limit
+                """
+            )
+            params = {"limit": limit}
+        async with self._session_factory() as session:
+            rows = (await session.execute(query, params)).fetchall()
+        return [str(r[0]) for r in rows]
+
+    async def prob_rate_cohort(
+        self, *, start_days_ago: int = 90, end_days_ago: int = 30,
+        split_days_ago: int | None = None,
+    ) -> list[dict]:
+        """예상 매칭확률 비율표용 정착 코호트 집계.
+
+        (seg, age_bucket, reuse, responder) 별 건수와 매칭 건수를 돌려준다.
+        매칭 정의 = status IN (40, 90).
+
+        코호트 = created_at 이 [now - start_days_ago, now - end_days_ago] 인 신청서.
+        end_days_ago 가 정착(settle) 여유다 — 결과가 여물 시간을 안 주면 최근 건이
+        전부 '미매칭'으로 잡혀 비율이 낮게 깎인다.
+        회귀 감시(backtest)는 여기에 더 오래된 구간을 넣어 과거 표를 재현한다.
+
+        각 구간은 대표 관측 시점(3h / 24h / 72h) 스냅샷으로 만든다.
+        그 시점에 **아직 열려 있던** 건만 세는 게 핵심 — 이미 확정·취소된 건을 넣으면
+        "지금 열려 있는 신청서가 앞으로 매칭될 확률"이라는 질문에 답하지 못한다.
+
+        성능: 신청서당 팩트를 derived table 에서 **한 번만** 만들고 구간 3개를 교차
+        조인한다. 구간마다 상관 서브쿼리를 다시 도는 형태로 짜면 평가 횟수가 3배가 된다.
+
+        재이용·응답 신호는 상관 서브쿼리가 아니라 **미리 집계한 derived table 조인**이다.
+        상관 서브쿼리 판은 코호트가 80일로 늘어나자 Cloud Run 300s 요청 타임아웃을
+        넘겨 504 가 났다(2026-09-07, 정착 30→10일 변경 직후). 신청서 8천 건 × 2개
+        서브쿼리 = 1.6만 회 평가가 집계 2회 + 조인으로 바뀐다.
+        recommendation_teachers 는 rt_days 로 잘라 derived table 을 작게 유지한다 —
+        rt 행은 신청서 생성 시각 이후에 생기므로 코호트 시작보다 앞선 행은 필요 없다.
+
+        split_days_ago — 주면 결과에 period('older'|'newer') 가 붙는다.
+        회귀 감시는 학습·채점 구간이 서로 **붙어 있으므로**, 두 번 호출하는 대신
+        합친 구간을 한 번 뽑아 나눈다. 부모 이력 derived table 이 16만 행을 훑어
+        4.9만 행을 만드는데 호출마다 다시 만들어져, 두 번 돌리면 요청 타임아웃에 걸린다.
+        """
+        query = text(
+            """
+            SELECT f.seg, b.bucket AS age_bucket, f.reuse,
+                   (f.first_resp IS NOT NULL
+                    AND f.first_resp <= DATE_ADD(f.created_at, INTERVAL b.h HOUR)) AS responder,
+                   f.period,
+                   COUNT(*) AS n,
+                   SUM(f.m) AS matched
+              FROM (
+                    SELECT r.created_at, r.confirmed_at, r.cancelled_at,
+                           CASE WHEN :split_days IS NULL THEN 'all'
+                                WHEN r.created_at <
+                                     DATE_SUB(NOW(), INTERVAL :split_days DAY)
+                                THEN 'older' ELSE 'newer' END AS period,
+                           CASE WHEN r.is_urgent = 1 THEN 'urgent'
+                                WHEN r.regularity = 3 THEN 'reg3'
+                                ELSE 'reg2' END AS seg,
+                           (r.status IN (40, 90)) AS m,
+                           (ph.first_matched_at IS NOT NULL
+                            AND ph.first_matched_at < r.created_at) AS reuse,
+                           rt.first_resp
+                      FROM recommendation r
+                      LEFT JOIN (
+                            SELECT p.parent_account_sid,
+                                   MIN(p.created_at) AS first_matched_at
+                              FROM recommendation p
+                             WHERE p.status IN (40, 90)
+                             GROUP BY p.parent_account_sid
+                           ) ph ON ph.parent_account_sid = r.parent_account_sid
+                      LEFT JOIN (
+                            SELECT t.recommendation_sid,
+                                   MIN(COALESCE(
+                                     NULLIF(t.last_responded_at, '0000-00-00 00:00:00'),
+                                     t._created_at)) AS first_resp
+                              FROM recommendation_teachers t
+                             WHERE (t.applied = 1 OR t.accepted = 1)
+                               AND t._created_at >=
+                                   DATE_SUB(NOW(), INTERVAL :rt_days DAY)
+                             GROUP BY t.recommendation_sid
+                           ) rt ON rt.recommendation_sid = r.sid
+                     WHERE r.created_at >= DATE_SUB(NOW(), INTERVAL :start_days DAY)
+                       AND r.created_at <= DATE_SUB(NOW(), INTERVAL :end_days DAY)
+                   ) f
+              JOIN (
+                        SELECT 'lt6h' AS bucket, 3 AS h
+              UNION ALL SELECT '6to48h', 24
+              UNION ALL SELECT 'gte48h', 72
+                   ) b
+             WHERE (f.confirmed_at <= '2000-01-01'
+                    OR f.confirmed_at > DATE_ADD(f.created_at, INTERVAL b.h HOUR))
+               AND (f.cancelled_at <= '2000-01-01'
+                    OR f.cancelled_at > DATE_ADD(f.created_at, INTERVAL b.h HOUR))
+             GROUP BY f.seg, b.bucket, f.reuse, responder, f.period
+            """
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(
+                query, {"start_days": start_days_ago, "end_days": end_days_ago,
+                        "rt_days": start_days_ago + 10,
+                        "split_days": split_days_ago}
+            )).fetchall()
+        return [
+            {"seg": r[0], "age_bucket": r[1], "reuse": int(r[2]),
+             "responder": int(r[3]), "period": r[4],
+             "n": int(r[5]), "matched": int(r[6] or 0)}
+            for r in rows
+        ]
+
+    async def outcome_stats(self, sids: list[str], until=None) -> dict[str, int]:
+        """자동 디스패치가 처리한 신청서들의 성과 집계.
+
+        분모는 **suggested=1 (방문 제안을 실제로 받은 선생님)** 이다.
+        자발 지원(suggested=0, applied=1)은 봇 성과가 아니므로 분자·분모 모두에서 뺀다.
+
+        2026-09-03 정정: 이전 구현은 신청서에 달린 **모든** 행의 accepted 를 세고
+        분모로 PG succeed_count 를 썼다. 신청서 1건당 제안 외 행이 다수 섞여
+        수락률이 15.94% 처럼 비현실적으로 부풀었다(실제는 1% 대).
+
+        until 을 주면 그 시각 이전에 생성된 행만 센다. 전/후 구간의 관측 시간을
+        같게 맞추기 위한 것 — 없으면 시점 무관 전량.
+        """
+        if not sids:
+            return {"apps": 0, "offered": 0, "accepted": 0, "rejected": 0, "matched": 0}
+        cond = "" if until is None else " AND rt._created_at < :until"
+        params: dict[str, Any] = {"sids": sids}
+        if until is not None:
+            params["until"] = until
+        q_t = text(
+            f"""
+            SELECT
+              SUM(rt.suggested = 1) AS offered,
+              SUM(rt.suggested = 1 AND rt.accepted = 1) AS accepted,
+              SUM(rt.suggested = 1 AND rt.rejected = 1) AS rejected
+            FROM recommendation_teachers rt
+            WHERE rt.recommendation_sid IN :sids{cond}
+            """
+        ).bindparams(bindparam("sids", expanding=True))
+        q_r = text(
+            """
+            SELECT
+              COUNT(*) AS apps,
+              SUM(CASE WHEN r.status IN (40, 90) THEN 1 ELSE 0 END) AS matched
+            FROM recommendation r
+            WHERE r.sid IN :sids
+            """
+        ).bindparams(bindparam("sids", expanding=True))
+        async with self._session_factory() as session:
+            t = (await session.execute(q_t, params)).first()
+            r = (await session.execute(q_r, {"sids": sids})).first()
+        return {
+            "apps": int((r and r[0]) or 0),
+            "matched": int((r and r[1]) or 0),
+            "offered": int((t and t[0]) or 0),
+            "accepted": int((t and t[1]) or 0),
+            "rejected": int((t and t[2]) or 0),
+        }
+
     async def list_wage_ranges(self, sids: list[str]) -> dict[str, list[str]]:
         """신청서 sid → 부모님이 선택한 wage_range_type 코드 리스트 (DesiredCost enum).
 
@@ -914,8 +1112,17 @@ class JarandaReplica:
             recommendation_teachers 에 requested=1 row 없음
             (부모가 신청서에서 특정 선생님을 콕 찍은 케이스는 자동화 대상에서 제외 —
             의향이 분명한 신청서를 시스템이 흔들지 않음)
-          - **지원·수락 0명**: recommendation_teachers 에 applied=1 OR accepted=1
-            row 없음 (운영자가 추천한 선생님이 있어도 응답이 없으면 자동화 대상)
+          - **수업 가능한 선생님 1명 이하**: recommendation_teachers 에서
+            applied=1 OR accepted=1 인 선생님 수 <= 1
+            (2026-09-02 변경: 이전에는 0명만 대상. 1명뿐이면 부모가 비교할 선택지가
+            사실상 없어 자동화로 후보를 늘려준다. 이미 응답한 선생님은
+            list_candidate_teachers 의 NOT EXISTS rt 로 중복 추가되지 않는다.)
+            NOTE: 기존 지목 체크와 동일하게 is_deleted 는 보지 않는다.
+          - **부모 주시 등급 제외**: account.observation_level IN (9, 90, 99)
+            = 관리필요(ELEPHANT 9) · 추천제한(DOLPHIN 90) · 이용제한(TURTLE 99).
+            관리필요는 매칭에 각별한 주의가 필요한 가정이라 사람이 봐야 하고,
+            추천제한·이용제한은 정책상 추천 자체를 막은 고객.
+            ObservationLevel enum (app-server domain/account/model/ObservationLevel.java).
 
         candidates.py 라우트와 동일한 필드 풀 셀렉트 → 호출자는 _parse_schedule /
         list_candidate_teachers 로 그대로 넘길 수 있음. list_candidate_teachers 가
@@ -954,7 +1161,13 @@ class JarandaReplica:
                 JOIN tag tg ON tg.id = rtag.tag_id
                 WHERE rtag.recommendation_sid = r.sid AND rtag.deleted_at IS NULL
               ) AS subject_tag_names,
-              0 AS applied_count
+              0 AS applied_count,
+              (
+                SELECT COUNT(DISTINCT rt.teacher_account_sid)
+                  FROM recommendation_teachers rt
+                 WHERE rt.recommendation_sid = r.sid
+                   AND (rt.applied = 1 OR rt.accepted = 1)
+              ) AS pre_responder_count
             FROM recommendation r
             WHERE r.status = 10
               AND r.created_at <= NOW() - INTERVAL :min_age MINUTE
@@ -969,10 +1182,16 @@ class JarandaReplica:
                 WHERE rt.recommendation_sid = r.sid
                   AND rt.requested = 1
               )
+              AND (
+                SELECT COUNT(DISTINCT rt.teacher_account_sid)
+                  FROM recommendation_teachers rt
+                 WHERE rt.recommendation_sid = r.sid
+                   AND (rt.applied = 1 OR rt.accepted = 1)
+              ) <= 1
               AND NOT EXISTS (
-                SELECT 1 FROM recommendation_teachers rt
-                WHERE rt.recommendation_sid = r.sid
-                  AND (rt.applied = 1 OR rt.accepted = 1)
+                SELECT 1 FROM account pa
+                WHERE pa.sid = r.parent_account_sid
+                  AND pa.observation_level IN (9, 90, 99)
               )
             ORDER BY r.created_at ASC
             LIMIT :limit

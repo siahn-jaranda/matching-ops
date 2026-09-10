@@ -22,7 +22,10 @@ from src.routes import (
     handlers,
     insights,
     managed,
+    manual_ops,
     memos,
+    prob_rate,
+    reports,
 )
 
 logging.basicConfig(level=settings.log_level)
@@ -60,6 +63,9 @@ app.include_router(handlers.router, dependencies=[Depends(auth.require_auth)])
 # 관리 신청서 목록 — 라우트 내부에서 trigger_auth 사용 (Google 세션 OR X-Trigger-Secret)
 app.include_router(managed.router)
 
+# 수동관리 신청서 — 인증은 라우터 내부 trigger_auth
+app.include_router(manual_ops.router)
+
 # LLM 인사이트 — POST는 호출당 비용. 라우트 내부에서 일일 한도 가드.
 app.include_router(insights.router, dependencies=[Depends(auth.require_auth)])
 
@@ -72,6 +78,12 @@ app.include_router(auto_dispatch.router)
 
 # 메모 집계 인사이트 — 필터 5종 + LLM. 라우트 내부 trigger_auth.
 app.include_router(aggregated_insights.router)
+
+# 배포 전/후 비교 일일 리포트 — 자체 인증(X-Trigger-Secret 또는 세션)
+app.include_router(reports.router)
+
+# 예상 매칭확률 비율표 — 조회·갱신 모두 trigger_auth (세션 또는 X-Trigger-Secret)
+app.include_router(prob_rate.router)
 
 
 @app.get("/")
