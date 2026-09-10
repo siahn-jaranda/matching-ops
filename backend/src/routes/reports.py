@@ -66,6 +66,47 @@ def _delta(after: Any, before: Any, unit: str, higher_better: bool) -> str:
     return "%s %+.1f%s%s" % ("▲" if d > 0 else "▼", d, unit, "" if good else " ⚠")
 
 
+_GRP_LABEL = {"llm": "LLM 랭킹", "fallback": "규칙 랭킹(폴백)"}
+
+
+async def _model_split_block(store, replica, start: datetime, end: datetime) -> str:
+    """랭킹 방식별 성과. 2026-09-10 폴백 도입 이후 둘을 섞어 보면 안 된다.
+
+    🚨 이건 A/B 가 아니다. 두 방식이 **시기로 갈린다**(LLM ~9/10, 폴백 9/10~).
+    계절성·유입 변화·다른 개입이 섞이므로 방향 참고용이다. 진짜 비교는 한도가
+    풀린 뒤 variant 를 랜덤 배정해야 나온다. 그 한계를 리포트에 같이 적는다.
+    """
+    try:
+        split = await store.model_split(start, end)
+    except Exception:
+        logger.exception("model_split 조회 실패 (graceful)")
+        return ""
+    if len(split) < 2 and not any(g == "fallback" for g in split):
+        return ""  # 폴백이 아직 안 돌았으면 섹션 자체를 띄우지 않는다
+
+    lines = ["%-16s %6s %6s %7s %8s %8s" % ("방식", "실행", "성공", "건당추가", "수락률", "매칭률"),
+             "-" * 56]
+    for grp in ("llm", "fallback"):
+        g = split.get(grp)
+        if not g:
+            continue
+        try:
+            oc = await replica.outcome_stats(g["sids"], until=end.replace(tzinfo=None))
+        except Exception:
+            logger.exception("outcome_stats 실패 grp=%s (graceful)", grp)
+            oc = {}
+        acc = _pct(oc.get("accepted"), oc.get("offered"))
+        mat = _pct(oc.get("matched"), oc.get("apps"))
+        lines.append("%-16s %6d %6d %7s %7s%% %7s%%"
+                     % (_GRP_LABEL[grp], g["runs"], g["ok"],
+                        _fmt(g.get("avg_added")), _fmt(acc), _fmt(mat)))
+
+    return ("\n\n*랭킹 방식별* — 앵커 이후 누적\n```\n%s\n```"
+            "_시기로 갈린 비교라 A/B 가 아닙니다. LLM 은 2026-09-10 이전, 폴백은 이후 —"
+            " 계절성·유입 변화가 섞입니다. 확정하려면 한도 복구 후 랜덤 배정이 필요합니다._"
+            % "\n".join(lines))
+
+
 def _build_text(day_n: int, window: timedelta, bs: datetime, be: datetime,
                 as_: datetime, ae: datetime, b: dict, a: dict, final: bool) -> str:
     hrs = window.total_seconds() / 3600
@@ -140,6 +181,8 @@ async def ab_daily(user: dict = Depends(trigger_auth)) -> dict[str, Any]:
     b = await _window_stats(store, replica, bs, be)
     a = await _window_stats(store, replica, as_, ae)
     body = _build_text(day_n, window, bs, be, as_, ae, b, a, final)
+    # 앵커 이후 전 구간을 방식별로 가른다. 폴백이 없으면 빈 문자열이라 표시 안 됨.
+    body += await _model_split_block(store, replica, anchor, now)
 
     sent = False
     url = settings.ab_report_webhook.strip()

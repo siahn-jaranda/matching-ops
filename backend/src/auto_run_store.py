@@ -71,6 +71,53 @@ class AutoRunStore:
             sids = [r[0] for r in (await session.execute(sids_q, {"s": start, "e": end}))]
         return dict(m or {}), sids
 
+    async def model_split(self, start, end) -> dict:
+        """[start, end) 구간을 **랭킹 방식별**로 가른 집계.
+
+        2026-09-10 Anthropic 한도로 LLM 이 막히면서 규칙 랭킹 폴백이 돌기 시작했다.
+        둘을 섞어 보면 폴백 도입 이후 지표 변화를 LLM 성과로 오독하게 된다.
+
+        구분은 llm_model_id 로 한다 — 폴백은 FALLBACK_MODEL_ID('fallback-rule-v1')로
+        기록되므로 접두사로 가른다. 모델명이 바뀌어도(sonnet→opus 등) llm 쪽은
+        그대로 llm 으로 묶인다.
+
+        반환 = {'llm': {..., 'sids': [...]}, 'fallback': {...}}
+        """
+        q = text(
+            """
+            SELECT CASE WHEN llm_model_id LIKE 'fallback-%' THEN 'fallback'
+                        ELSE 'llm' END AS grp,
+                   COUNT(*) AS runs,
+                   COUNT(*) FILTER (WHERE succeed_count > 0) AS ok,
+                   COALESCE(SUM(succeed_count), 0) AS sent,
+                   ROUND(AVG(succeed_count) FILTER (WHERE succeed_count > 0), 1) AS avg_added,
+                   percentile_disc(0.5) WITHIN GROUP (ORDER BY pool_size)
+                     FILTER (WHERE succeed_count > 0) AS pool_p50
+              FROM matching_ops_auto_run
+             WHERE dry_run = false AND run_at >= :s AND run_at < :e
+             GROUP BY 1
+            """
+        )
+        sids_q = text(
+            """
+            SELECT CASE WHEN llm_model_id LIKE 'fallback-%' THEN 'fallback'
+                        ELSE 'llm' END AS grp,
+                   recommendation_sid
+              FROM matching_ops_auto_run
+             WHERE dry_run = false AND run_at >= :s AND run_at < :e
+               AND succeed_count > 0
+            """
+        )
+        out: dict = {}
+        async with self._session_factory() as session:
+            for m in (await session.execute(q, {"s": start, "e": end})).mappings():
+                d = dict(m)
+                out[d.pop("grp")] = {**d, "sids": []}
+            for grp, sid in (await session.execute(sids_q, {"s": start, "e": end})):
+                if grp in out:
+                    out[grp]["sids"].append(sid)
+        return out
+
     async def get_excluded_sids(
         self, sids: list[str], *, max_attempts: int = 4, retry_after_minutes: int = 360
     ) -> set[str]:
