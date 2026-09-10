@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Body, Depends
 
 from src.auto_run_store import auto_run_available, get_auto_run_store
 from src.config import settings
@@ -156,7 +156,19 @@ def _build_text(day_n: int, window: timedelta, bs: datetime, be: datetime,
 
 
 @router.post("/ab-daily")
-async def ab_daily(user: dict = Depends(trigger_auth)) -> dict[str, Any]:
+async def ab_daily(
+    options: dict[str, Any] = Body(default_factory=dict),
+    user: dict = Depends(trigger_auth),
+) -> dict[str, Any]:
+    """배포 전/후 비교 리포트. Cloud Scheduler 가 매일 13:00 KST 호출한다.
+
+    슬랙 발송은 body 에 notify=true 를 준 호출에서만 한다. 기본이 발송이면
+    본문을 확인하려는 수동 호출이 그대로 사용자 DM 에 나간다 — prob-rate/audit 에서
+    같은 실수를 하고 고쳤는데 여기서 반복했다(2026-09-10). 스케줄러만 그 값을 보낸다.
+    """
+    # 아래에서 지역변수 body(리포트 본문)를 쓰므로 요청 옵션은 맨 위에서 뽑는다.
+    notify = bool(options.get("notify"))
+
     if not auto_run_available():
         return {"status": "skipped", "reason": "MATCHING_OPS_DB_URL 미설정"}
 
@@ -187,7 +199,7 @@ async def ab_daily(user: dict = Depends(trigger_auth)) -> dict[str, Any]:
     sent = False
     url = settings.ab_report_webhook.strip()
     target = settings.ab_report_slack_target.strip()
-    if url:
+    if notify and url:
         payload: dict[str, Any] = {"text": body}
         if target:
             payload["channel"] = target
@@ -200,8 +212,9 @@ async def ab_daily(user: dict = Depends(trigger_auth)) -> dict[str, Any]:
         except Exception:
             logger.exception("ab_daily webhook post failed")
 
-    logger.info("ab_daily day=%d final=%s sent=%s before=%s after=%s",
-                day_n, final, sent, json.dumps(b, default=str), json.dumps(a, default=str))
+    logger.info("ab_daily day=%d final=%s notify=%s sent=%s before=%s after=%s",
+                day_n, final, notify, sent,
+                json.dumps(b, default=str), json.dumps(a, default=str))
     return {"status": "ok", "day": day_n, "final": final, "sent": sent,
             "window_hours": round(window.total_seconds() / 3600, 2),
             "before": b, "after": a, "text": body}
