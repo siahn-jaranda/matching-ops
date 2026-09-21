@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -885,28 +884,43 @@ def _make_summary(
     }
 
 
-# 폴백 알림은 매 실행마다 보내면 10분마다 울린다. 한 시간에 한 번으로 묶는다.
-_FALLBACK_NOTICE_AT = 0.0
+_FALLBACK_NOTICE_KEY = "auto_dispatch_llm_fallback"
 
 
 async def _post_fallback_notice(n: int, summary: dict[str, Any]) -> None:
-    """LLM 대신 규칙 랭킹으로 처리했음을 알린다. 실패해도 본류에 영향 없다."""
-    global _FALLBACK_NOTICE_AT
-    now = time.monotonic()
-    if now - _FALLBACK_NOTICE_AT < 3600:
+    """LLM 대신 규칙 랭킹으로 처리했음을 알린다. 실패해도 본류에 영향 없다.
+
+    🚨 억제 상태는 **PG 에 둔다**. 예전엔 모듈 전역 float + time.monotonic() 이었는데,
+    Cloud Run 은 인스턴스가 여럿이고 수시로 재기동돼 인스턴스마다 따로 세는 바람에
+    "시간당 1회"가 지켜지지 않았다(2026-09-21 제보). 게다가 monotonic 은 프로세스
+    기동 시각이 0 이라, 갓 뜬 컨테이너에서는 첫 알림이 오히려 영영 억제됐다.
+
+    주기도 바꿨다. 시간당 1회는 짧은 장애용이다. 이번 건은 9/18 키 무효 이후
+    사흘 넘게 이어졌고 보조 키도 10/1 까지 한도라 열흘이 더 남았다 — 그대로면
+    240회가 온다. 사람이 이미 아는 사실을 240번 알리면 다음 진짜 경보도 묻힌다.
+    이제 즉시 → 1시간 → 4시간 → 이후 24시간으로 간격을 벌린다.
+    """
+    store = get_auto_run_store() if auto_run_available() else None
+    if store is None:
+        logger.warning("LLM 폴백 %d건 — 알림 상태 저장소 없음, 로그만 남김", n)
         return
+    send, streak = await store.should_notify(_FALLBACK_NOTICE_KEY)
+    if not send:
+        logger.info("LLM 폴백 %d건 (%d회차) — 알림 간격 내라 발송 생략", n, streak)
+        return
+
     url = (settings.ab_report_webhook or settings.auto_dispatch_slack_webhook).strip()
     if not url:
         logger.warning("LLM 폴백 %d건 처리 — 알림 웹훅 미설정이라 로그만 남김", n)
-        _FALLBACK_NOTICE_AT = now
         return
     text_body = (
-        "⚠️ *matching-ops 자동 디스패치 — LLM 없이 규칙 랭킹으로 처리 중*\n"
+        "⚠️ *matching-ops 자동 디스패치 — LLM 없이 규칙 랭킹으로 처리 중* (%d회차)\n"
         "이번 실행에서 %d건을 `%s` 로 처리했습니다. LLM 랭킹이 아니라 "
         "요일·경력·추천율 기반 결정적 순위입니다.\n"
-        "_Anthropic API 가 복구되면 자동으로 LLM 랭킹으로 돌아갑니다. "
-        "이 알림은 1시간에 한 번만 보냅니다._"
-    ) % (n, FALLBACK_MODEL_ID)
+        "원인은 `GET /api/diag/llm-keys` 로 확인할 수 있습니다.\n"
+        "_복구되면 자동으로 LLM 랭킹으로 돌아가고 이 알림도 멈춥니다. "
+        "같은 상태가 이어지면 알림 간격을 1시간 → 4시간 → 하루로 늘립니다._"
+    ) % (streak, n, FALLBACK_MODEL_ID)
     payload: dict[str, Any] = {"text": text_body}
     target = settings.ab_report_slack_target.strip()
     if target and url == settings.ab_report_webhook.strip():
@@ -918,7 +932,7 @@ async def _post_fallback_notice(n: int, summary: dict[str, Any]) -> None:
             logger.error("fallback notice webhook %s %s", r.status_code, r.text[:200])
     except Exception:
         logger.exception("fallback notice post failed (graceful)")
-    _FALLBACK_NOTICE_AT = now
+    logger.info("LLM 폴백 알림 발송 %d회차 (%d건)", streak, n)
 
 
 async def _maybe_alert_llm_failures(
@@ -942,6 +956,11 @@ async def _maybe_alert_llm_failures(
     n_fb = int(summary.get("llm_fallback_used") or 0)
     if n_fb:
         await _post_fallback_notice(n_fb, summary)
+    elif summary.get("by_status", {}).get("live") or summary.get("by_status", {}).get("dry_run"):
+        # LLM 으로 정상 처리된 실행이 있었다 = 상태 해소. streak 을 되돌려
+        # 다음에 다시 죽으면 즉시 알리게 한다.
+        if auto_run_available():
+            await get_auto_run_store().clear_notice(_FALLBACK_NOTICE_KEY)
     if not any(r.get("error") == "llm_failed" for r in processed):
         return
     threshold = settings.llm_failure_alert_threshold

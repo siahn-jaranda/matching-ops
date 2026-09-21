@@ -243,6 +243,70 @@ class AutoRunStore:
             await session.commit()
 
 
+    async def should_notify(self, key: str, *, steps=(0, 3600, 14400, 86400)) -> tuple[bool, int]:
+        """알림을 지금 보낼지. (보낼지, 이번이 몇 번째인지) 반환.
+
+        억제 상태를 **공유 저장소**에 둔다. 프로세스 메모리로는 Cloud Run 의
+        다중 인스턴스·재기동을 못 넘어 억제가 무력해진다(2026-09-21 실측:
+        폴백 알림이 "시간당 1회"인데도 계속 나갔고, 하루에 인스턴스 2개가 관여했다).
+
+        같은 상태가 이어지면 간격을 늘린다 — steps[min(streak, last)] 초.
+        기본값은 즉시 → 1시간 → 4시간 → 이후 24시간.
+        사람이 이미 아는 사실을 반복하면 다음 진짜 경보까지 같이 무시된다.
+
+        보낸다고 판정하면 그 자리에서 last_sent_at·streak 을 올린다 —
+        호출부가 실패해도 재시도로 도배되지 않게 하려는 것(알림은 재시도 가치가 낮다).
+        """
+        sql = text(
+            """
+            INSERT INTO matching_ops_notice_state (notice_key, last_sent_at, streak, updated_at)
+            VALUES (:k, NOW(), 1, NOW())
+            ON CONFLICT (notice_key) DO UPDATE SET
+                -- streak 은 **실제로 보낸 횟수**다. 확인할 때마다 올리면 간격이
+                -- cron 주기에 끌려간다(10분 cron 이면 40분 만에 24시간 간격으로 점프).
+                streak = matching_ops_notice_state.streak
+                         + CASE WHEN :send THEN 1 ELSE 0 END,
+                last_sent_at = CASE WHEN :send THEN NOW()
+                                    ELSE matching_ops_notice_state.last_sent_at END,
+                updated_at = NOW()
+            RETURNING streak
+            """
+        )
+        read = text("SELECT last_sent_at, streak FROM matching_ops_notice_state"
+                    " WHERE notice_key = :k")
+        try:
+            async with self._session_factory() as session:
+                row = (await session.execute(read, {"k": key})).first()
+                if row is None:
+                    streak, elapsed = 0, None
+                else:
+                    last, streak = row[0], int(row[1])
+                    elapsed = None if last is None else (
+                        await session.execute(
+                            text("SELECT EXTRACT(EPOCH FROM (NOW() - :t))"), {"t": last})
+                    ).scalar()
+                gap = steps[min(streak, len(steps) - 1)]
+                send = elapsed is None or float(elapsed) >= gap
+                res = (await session.execute(sql, {"k": key, "send": send})).first()
+                await session.commit()
+                return send, int(res[0]) if res else streak
+        except Exception:
+            logger.exception("should_notify 조회 실패 — 이번 회차는 보내지 않는다 (graceful)")
+            # 실패 시 **보내지 않는** 쪽으로 기운다. 억제 상태를 모르는데 보내면
+            # 도배가 되고, 한 번 건너뛰는 손해가 훨씬 작다.
+            return False, 0
+
+    async def clear_notice(self, key: str) -> None:
+        """상태가 해소되면 streak 을 0 으로. 다음 발생 때 다시 즉시 알린다."""
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    text("UPDATE matching_ops_notice_state SET streak = 0, updated_at = NOW()"
+                         " WHERE notice_key = :k AND streak <> 0"), {"k": key})
+                await session.commit()
+        except Exception:
+            logger.exception("clear_notice 실패 (graceful)")
+
     async def count_today_runs(self, *, dry_run: bool = False) -> int:
         """KST 오늘 자정 이후 처리된 신청서 수. 일일 cap 강제용."""
         kst_midnight = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0)
