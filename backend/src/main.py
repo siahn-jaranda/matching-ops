@@ -19,6 +19,7 @@ from src.routes import (
     applications,
     auto_dispatch,
     candidates,
+    diag,
     handlers,
     insights,
     managed,
@@ -84,6 +85,9 @@ app.include_router(reports.router)
 
 # 예상 매칭확률 비율표 — 조회·갱신 모두 trigger_auth (세션 또는 X-Trigger-Secret)
 app.include_router(prob_rate.router)
+
+# 운영 진단 — 키 유효성 등. 인증은 라우터 내부 trigger_auth
+app.include_router(diag.router)
 
 
 @app.get("/")

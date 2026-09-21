@@ -187,16 +187,24 @@ _FAILOVER_HINTS = ("usage limit", "credit balance", "quota", "billing", "spend l
 def is_failover_error(exc: BaseException) -> bool:
     """보조 키로 재시도할 가치가 있는 오류인가.
 
-    - 429 RateLimitError / 529 overloaded → 무조건
-    - 400·403 은 프롬프트 오류일 수도 있어 메시지에 한도·과금 힌트가 있을 때만.
-      (한도 소진은 400 invalid_request_error 로 온다)
+    판정 기준은 "**키에 달린 문제인가, 요청에 달린 문제인가**" 하나다.
+    키 문제면 다른 키로 바꿔볼 값이 있고, 요청 문제면 키를 바꿔도 똑같이 실패한다.
+
+    - 401 authentication_error — 키 자체가 무효. 요청과 무관하므로 무조건 넘긴다.
+      🚨 처음엔 401 을 아예 다루지 않아 폴백이 시도조차 안 됐다. 2026-09-18 주 키를
+      잘못 넣은 뒤 3일간 authentication_error 32건이 쌓였고, 보조 키가 있었는데도
+      안전망이 작동하지 않았다.
+    - 403 permission_error — 그 키에 모델·기능 권한이 없는 경우. 다른 키는 있을 수 있다.
+    - 429 RateLimitError / 529 overloaded — 일시적. 무조건.
+    - 400 은 프롬프트 오류와 한도 소진이 같은 코드로 와서 구분이 안 된다.
+      메시지에 한도·과금 힌트가 있을 때만 넘긴다(한도 소진이 400 으로 온다).
     """
     if isinstance(exc, anthropic.RateLimitError):
         return True
     status = getattr(exc, "status_code", None)
-    if status in (429, 529):
+    if status in (401, 403, 429, 529):
         return True
-    if status in (400, 403):
+    if status == 400:
         msg = str(exc).lower()
         return any(h in msg for h in _FAILOVER_HINTS)
     return False
